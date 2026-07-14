@@ -3,9 +3,9 @@ title = Mango LWT Recorder
 package.name = mangolwtrecorder
 package.domain = au.edu.research
 source.dir = .
-source.include_exts = py,png,jpg,kv,atlas,csv
-version = 0.1.0
-requirements = python3,kivy
+source.include_exts = py,png,jpg,kv,atlas,csv,xml
+version = 0.2.0
+requirements = python3,kivy,pyjnius
 orientation = portrait
 fullscreen = 0
 
@@ -14,10 +14,12 @@ android.api = 35
 android.minapi = 24
 android.archs = arm64-v8a, armeabi-v7a
 android.accept_sdk_license = True
-android.permissions = READ_EXTERNAL_STORAGE, WRITE_EXTERNAL_STORAGE
+android.permissions = READ_EXTERNAL_STORAGE, WRITE_EXTERNAL_STORAGE, RECORD_AUDIO
+android.extra_manifest_xml = ./src/android/extra_manifest.xml
 
-# No network permission is requested: the app is offline-first.
-# Storage permission keeps CSV export compatible with older Android versions.
+# The app itself requests no INTERNET permission. Android's installed speech
+# recognition service may still use its own network access when on-device
+# recognition is unavailable. Storage permissions retain older-device CSV export.
 
 [buildozer]
 log_level = 2

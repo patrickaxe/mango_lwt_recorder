@@ -12,14 +12,24 @@ The on-screen fields are:
 - L (mm)
 - W (mm)
 - T (mm)
+- Weight (g)
+- Brix (°)
 
 Exported CSV columns:
 
 ```text
-Block,TreeID,PanicleID,L,W,T,Timestamp
+Block,TreeID,PanicleID,L,W,T,Weight,Brix,Timestamp
 ```
 
-Data is saved immediately to a local SQLite database. Block and TreeID remain unchanged after saving. A numeric PanicleID automatically increases by one.
+Data is saved immediately to a local SQLite database. Partially completed rows
+can be saved as long as at least one field has a value; only populated numeric
+fields are validated. Block and TreeID remain unchanged after saving. A numeric
+PanicleID automatically increases by one.
+
+Records are grouped into worksheets. The worksheet selector changes the active
+worksheet; record counts, `UNDO LAST`, and CSV export apply only to the active
+worksheet. Use `NEW` to create and name a fresh worksheet without deleting the
+older worksheets.
 
 CSV exports are saved to the device Downloads folder. On Android this is:
 
@@ -56,11 +66,14 @@ buildozer android debug
 ```
 
 ```bash
-cp /mnt/c/Users/Folder_To_Downloads/mango_lwt_recorder_kivy/mango_lwt_recorder/main.py ~/mango_lwt_recorder/main.py
-cp /mnt/c/Users/Folder_To_Downloads/mango_lwt_recorder_kivy/mango_lwt_recorder/buildozer.spec ~/mango_lwt_recorder/buildozer.spec
-cd ~/mango_lwt_recorder
-python3 -m venv .venv
+mkdir mango_lwt_recorder
+cd mango_lwt_recorder
+cp /mnt/c/Users/Folder_To_Downloads/mango_lwt_recorder/main.py ~/mango_lwt_recorder/main.py
+cp /mnt/c/Users/Folder_To_Downloads/mango_lwt_recorder/buildozer.spec ~/mango_lwt_recorder/buildozer.spec
+sudo apt update && sudo apt install python3.12-venv # only use for the first time user
+python3 -m venv .venv # only use for the first time user
 source .venv/bin/activate
+pip install buildozer # only use for the first time user
 buildozer android debug
 ```
 
@@ -85,12 +98,60 @@ The exact generated directory/project name can vary. Complete signing, bundle ID
 
 ## Using iPhone/Android dictation
 
-Tap an input field and use the phone keyboard's microphone. Press the keyboard's Return/Next key to advance. After entering T, Return saves the row. Dictation itself cannot issue a real Tab command, so this app is designed around Return/Next and a large `SAVE & NEXT` button.
+Tap an input field and use the phone keyboard's microphone. Press the keyboard's
+Return/Next key to advance. After entering Brix, Return saves the row. Dictation
+itself cannot issue a real Tab command, so the app also provides Android voice
+control and a large `SAVE & NEXT` button.
+
+### Android voice-control session
+
+Tap **START VOICE** and grant microphone permission. While the button says
+**STOP VOICE**, each completed utterance is recognized and the app automatically
+starts listening for the next utterance.
+
+- Speak a value to enter it into the currently selected field. English number
+  phrases such as **“twenty five point six”** are converted to `25.6` for numeric
+  fields.
+- Say **“next field”** to move to the next input field.
+- Say **“next fruit”** (or **“save and next”**) to run `SAVE & NEXT`. A partial
+  record is allowed; only a completely blank row is rejected.
+- Say **“delete last record”** to open the existing deletion confirmation.
+- Say **“stop listening”**, or tap **STOP VOICE**, to finish the session.
+
+Android's system `SpeechRecognizer` handles this mode. Depending on the phone and
+its installed recognition service, processing may occur on-device or may use a
+network connection. Android does not define this API as a permanent always-on
+listener, so the app implements the session by restarting recognition after each
+result or silence timeout. Stop the session when it is not needed to reduce
+battery use.
+
+On iPhone and desktop, the Voice control text box remains available as a fallback:
+type a command, or use the iPhone keyboard microphone and then press Return.
+
+### Voice-actuated delete
+
+1. Start Android voice control, or tap the **Voice control** field and use the
+   phone keyboard's microphone.
+2. Say **“delete last record”** (or **“delete the last record”**).
+3. Check the displayed Block, Tree, and Panicle, then tap **DELETE** to confirm.
+
+The command deletes only the most recent record in the active worksheet. The
+confirmation prevents an accidental dictation match from deleting data.
+
+### Worksheet and history controls
+
+- Select an existing worksheet from the **Worksheet** menu.
+- Tap **NEW** to name and create an empty worksheet while preserving all older
+  worksheets.
+- Tap **DELETE ALL HISTORY** to permanently remove every saved record and
+  worksheet. A confirmation shows the number of affected records and worksheets;
+  after deletion, the app creates a new empty `Worksheet 1`.
 
 ## Current limitations
 
 - CSV export writes to Downloads, but there is no native share sheet yet.
-- It does not perform offline speech recognition independently; it accepts text from the phone's available keyboard dictation.
+- Voice recognition depends on Android's installed recognition service or the
+  phone keyboard; on-device/offline recognition availability varies by device.
 - It has no record editing screen yet, but `UNDO LAST` removes the most recent row.
 
 ## Suggested next upgrade
