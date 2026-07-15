@@ -128,6 +128,15 @@ battery use.
 On iPhone and desktop, the Voice control text box remains available as a fallback:
 type a command, or use the iPhone keyboard microphone and then press Return.
 
+The Android speech result listener includes a small Java-to-Python string bridge.
+After pulling voice-control changes, use a clean build so the Java source is added
+to the APK:
+
+```bash
+buildozer android clean
+buildozer android debug
+```
+
 ### Voice-actuated delete
 
 1. Start Android voice control, or tap the **Voice control** field and use the

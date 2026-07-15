@@ -4,6 +4,7 @@ import csv
 import math
 import re
 import sqlite3
+import traceback
 from datetime import datetime
 from io import StringIO
 from pathlib import Path
@@ -26,69 +27,34 @@ from kivy.uix.textinput import TextInput
 if platform == "android":
     from android.runnable import run_on_ui_thread
 else:
+
     def run_on_ui_thread(function):
         return function
 
 
-def create_android_recognition_listener(
-    on_ready, on_results, on_partial_results, on_error, on_end
-):
-    """Build a Java RecognitionListener without importing PyJNIus on desktop."""
+def create_android_speech_callback(on_event):
+    """Build the safe string callback used by the Java recognition listener."""
     from jnius import PythonJavaClass, java_method
 
-    class AndroidRecognitionListener(PythonJavaClass):
-        __javainterfaces__ = ["android/speech/RecognitionListener"]
+    class AndroidSpeechCallback(PythonJavaClass):
+        __javainterfaces__ = ["org/mango/recorder/speech/SpeechCallback"]
         __javacontext__ = "app"
 
         def __init__(self):
             super().__init__()
 
-        @staticmethod
-        def _phrases(bundle):
-            if bundle is None:
-                return []
-            matches = bundle.getStringArrayList("results_recognition")
-            if matches is None:
-                return []
-            return [str(matches.get(index)) for index in range(matches.size())]
+        @java_method("(Ljava/lang/String;Ljava/lang/String;)V")
+        def onSpeechEvent(self, event_name, value):
+            try:
+                event_text = "" if event_name is None else str(event_name)
+                value_text = "" if value is None else str(value)
+                on_event(event_text, value_text)
+            except Exception:
+                # Never allow a Python exception to cross back into Android's
+                # speech service callback, which would terminate the activity.
+                traceback.print_exc()
 
-        @java_method("(Landroid/os/Bundle;)V")
-        def onReadyForSpeech(self, _params):
-            on_ready()
-
-        @java_method("()V")
-        def onBeginningOfSpeech(self):
-            pass
-
-        @java_method("(F)V")
-        def onRmsChanged(self, _rms_db):
-            pass
-
-        @java_method("([B)V")
-        def onBufferReceived(self, _buffer):
-            pass
-
-        @java_method("()V")
-        def onEndOfSpeech(self):
-            on_end()
-
-        @java_method("(I)V")
-        def onError(self, error_code):
-            on_error(error_code)
-
-        @java_method("(Landroid/os/Bundle;)V")
-        def onResults(self, bundle):
-            on_results(self._phrases(bundle))
-
-        @java_method("(Landroid/os/Bundle;)V")
-        def onPartialResults(self, bundle):
-            on_partial_results(self._phrases(bundle))
-
-        @java_method("(ILandroid/os/Bundle;)V")
-        def onEvent(self, _event_type, _params):
-            pass
-
-    return AndroidRecognitionListener()
+    return AndroidSpeechCallback()
 
 
 class MangoRecorder(BoxLayout):
@@ -114,6 +80,7 @@ class MangoRecorder(BoxLayout):
         self._speech_recognizer = None
         self._speech_intent = None
         self._speech_listener = None
+        self._speech_callback = None
         self._speech_error_count = 0
         self._voice_restart_event = None
         self._audio_permission_callback = None
@@ -955,6 +922,9 @@ class MangoRecorder(BoxLayout):
 
         SpeechRecognizer = autoclass("android.speech.SpeechRecognizer")
         RecognizerIntent = autoclass("android.speech.RecognizerIntent")
+        SpeechRecognitionListener = autoclass(
+            "org.mango.recorder.speech.SpeechRecognitionListener"
+        )
         Intent = autoclass("android.content.Intent")
         PythonActivity = autoclass("org.kivy.android.PythonActivity")
 
@@ -973,27 +943,11 @@ class MangoRecorder(BoxLayout):
                 self._speech_recognizer = (
                     SpeechRecognizer.createSpeechRecognizer(activity)
                 )
-                self._speech_listener = create_android_recognition_listener(
-                    lambda: Clock.schedule_once(
-                        lambda _dt: self._on_speech_ready(), 0
-                    ),
-                    lambda phrases: Clock.schedule_once(
-                        lambda _dt, values=tuple(phrases):
-                        self._on_speech_results(values),
-                        0,
-                    ),
-                    lambda phrases: Clock.schedule_once(
-                        lambda _dt, values=tuple(phrases):
-                        self._on_speech_partial_results(values),
-                        0,
-                    ),
-                    lambda error_code: Clock.schedule_once(
-                        lambda _dt, code=error_code: self._on_speech_error(code),
-                        0,
-                    ),
-                    lambda: Clock.schedule_once(
-                        lambda _dt: self._on_speech_end(), 0
-                    ),
+                self._speech_callback = create_android_speech_callback(
+                    self._queue_android_speech_event
+                )
+                self._speech_listener = SpeechRecognitionListener(
+                    self._speech_callback
                 )
                 self._speech_recognizer.setRecognitionListener(
                     self._speech_listener
@@ -1010,10 +964,10 @@ class MangoRecorder(BoxLayout):
                     RecognizerIntent.EXTRA_LANGUAGE, "en-AU"
                 )
                 self._speech_intent.putExtra(
-                    RecognizerIntent.EXTRA_PARTIAL_RESULTS, True
+                    RecognizerIntent.EXTRA_PARTIAL_RESULTS, False
                 )
                 self._speech_intent.putExtra(
-                    RecognizerIntent.EXTRA_MAX_RESULTS, 3
+                    RecognizerIntent.EXTRA_MAX_RESULTS, 1
                 )
         except Exception as exc:
             message = str(exc)
@@ -1076,12 +1030,50 @@ class MangoRecorder(BoxLayout):
         if self._voice_restart_event is not None:
             self._voice_restart_event.cancel()
         self._voice_restart_event = Clock.schedule_once(
-            self._start_speech_cycle, delay
+            self._restart_speech_cycle, delay
         )
+
+    def _restart_speech_cycle(self, _dt):
+        # run_on_ui_thread replaces the decorated method with a wrapper named
+        # ``f2``. Scheduling that wrapper directly makes Kivy's WeakMethod look
+        # for MangoRecorder.f2 later and crash. Schedule this normal method and
+        # enter the Android UI-thread wrapper only when the event actually runs.
+        self._voice_restart_event = None
+        self._start_speech_cycle()
 
     def _on_speech_ready(self):
         if self._voice_control_enabled:
             self._set_status("Voice listening...")
+
+    def _queue_android_speech_event(self, event_name, value):
+        Clock.schedule_once(
+            lambda _dt, event=event_name, content=value:
+            self._handle_android_speech_event(event, content),
+            0,
+        )
+
+    def _handle_android_speech_event(self, event_name, value):
+        try:
+            if event_name == "ready":
+                self._on_speech_ready()
+            elif event_name == "end":
+                self._on_speech_end()
+            elif event_name == "results":
+                self._on_speech_results((value,) if value else ())
+            elif event_name == "partial":
+                self._on_speech_partial_results((value,) if value else ())
+            elif event_name == "error":
+                try:
+                    error_code = int(value)
+                except (TypeError, ValueError):
+                    error_code = 5
+                self._on_speech_error(error_code)
+        except Exception:
+            # Keep unexpected result parsing/UI errors inside the Kivy event loop.
+            traceback.print_exc()
+            if self._voice_control_enabled:
+                self._set_status("Voice result error; listening again")
+                self._schedule_voice_restart(0.8)
 
     def _on_speech_end(self):
         self._speech_listening = False
@@ -1165,6 +1157,7 @@ class MangoRecorder(BoxLayout):
                 pass
             self._speech_recognizer = None
             self._speech_listener = None
+            self._speech_callback = None
             self._speech_intent = None
 
     def _last_record(self):
