@@ -58,6 +58,8 @@ def create_android_speech_callback(on_event):
 
 
 class MangoRecorder(BoxLayout):
+    MODE_LWT = "LWT only"
+    MODE_FULL = "LWT + Weight + Brix"
     VOICE_DELETE_COMMANDS = {"delete last record", "delete the last record"}
     VOICE_NEXT_FIELD_COMMANDS = {"next field"}
     VOICE_NEXT_FRUIT_COMMANDS = {"next fruit", "save and next", "save next"}
@@ -86,8 +88,10 @@ class MangoRecorder(BoxLayout):
         self._audio_permission_callback = None
         self._focused_data_index = 0
         self._updating_worksheet_spinner = False
+        self.collection_mode = self.MODE_LWT
         self._init_database()
         self._load_active_worksheet()
+        self._load_collection_mode()
         self._build_ui()
         self._refresh_count()
         Clock.schedule_once(lambda _dt: setattr(self.block_input, "focus", True), 0.4)
@@ -212,6 +216,14 @@ class MangoRecorder(BoxLayout):
 
         self.active_worksheet_id, self.active_worksheet_name = row
 
+    def _load_collection_mode(self):
+        with sqlite3.connect(self.db_path) as con:
+            row = con.execute(
+                "SELECT value FROM settings WHERE key = 'collection_mode'"
+            ).fetchone()
+        if row is not None and row[0] in (self.MODE_LWT, self.MODE_FULL):
+            self.collection_mode = row[0]
+
     def _field(self, hint, multiline=False, input_filter=None):
         field = TextInput(
             hint_text=hint,
@@ -270,6 +282,24 @@ class MangoRecorder(BoxLayout):
         self.add_widget(worksheet_bar)
         self._refresh_worksheet_selector()
 
+        mode_bar = BoxLayout(
+            orientation="horizontal", spacing=dp(8), size_hint_y=None, height=dp(50)
+        )
+        mode_bar.add_widget(
+            Label(
+                text="[b]Mode[/b]", markup=True, font_size="17sp", size_hint_x=0.25
+            )
+        )
+        self.mode_spinner = Spinner(
+            text=self.collection_mode,
+            values=(self.MODE_LWT, self.MODE_FULL),
+            font_size="17sp",
+            size_hint_x=0.75,
+        )
+        self.mode_spinner.bind(text=self._switch_collection_mode)
+        mode_bar.add_widget(self.mode_spinner)
+        self.add_widget(mode_bar)
+
         scroll = ScrollView()
         form = GridLayout(cols=2, spacing=dp(8), size_hint_y=None)
         form.bind(minimum_height=form.setter("height"))
@@ -282,6 +312,8 @@ class MangoRecorder(BoxLayout):
         self.t_input = self._field("Thickness (mm)", input_filter="float")
         self.weight_input = self._field("Weight (g)", input_filter="float")
         self.brix_input = self._field("Brix (degrees)", input_filter="float")
+        self.weight_input.disabled = self.collection_mode == self.MODE_LWT
+        self.brix_input.disabled = self.collection_mode == self.MODE_LWT
         self.voice_command_input = self._field("Type/dictate command")
         self.voice_command_input.font_size = "14sp"
         self.voice_command_input.size_hint_x = 0.58
@@ -397,16 +429,40 @@ class MangoRecorder(BoxLayout):
 
     def _advance_or_save(self, index, fields):
         fields[index].focus = False
+        if self.collection_mode == self.MODE_LWT and fields[index] is self.t_input:
+            self.save_record()
+            return
         if index < len(fields) - 1:
             fields[index + 1].focus = True
         else:
             self.save_record()
 
+    def _switch_collection_mode(self, _spinner, mode):
+        if mode not in (self.MODE_LWT, self.MODE_FULL):
+            return
+        self.collection_mode = mode
+        with sqlite3.connect(self.db_path) as con:
+            con.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                ("collection_mode", mode),
+            )
+            con.commit()
+        if hasattr(self, "weight_input"):
+            lwt_only = mode == self.MODE_LWT
+            self.weight_input.disabled = lwt_only
+            self.brix_input.disabled = lwt_only
+            if lwt_only:
+                self.weight_input.text = ""
+                self.brix_input.text = ""
+                self.l_input.focus = True
+        self._set_status(f"Mode: {mode}")
+
     def _status_markup(self):
         status = escape_markup(self.status_text)
         worksheet = escape_markup(self.active_worksheet_name)
+        color = "32CD32" if self.status_text.startswith("Saved ") else "FFFFFF"
         return (
-            f"[b]{status}[/b]\n"
+            f"[color={color}][b]{status}[/b][/color]\n"
             f"Worksheet: {worksheet} | Saved records: {self.record_count}"
         )
 
@@ -595,10 +651,29 @@ class MangoRecorder(BoxLayout):
         weight_val = optional_number("Weight")
         brix_val = optional_number("Brix")
 
+        if self.collection_mode == self.MODE_LWT:
+            missing = [
+                name
+                for name, value in (("L", l_val), ("W", w_val), ("T", t_val))
+                if value == ""
+            ]
+            if missing:
+                raise ValueError(
+                    "LWT-only mode requires all three measurements. Missing: "
+                    + ", ".join(missing)
+                    + "."
+                )
+
         for name, value in (("L", l_val), ("W", w_val), ("T", t_val)):
             if value != "" and (value <= 0 or value > 300):
                 raise ValueError(
                     f"{name} must be greater than 0 and no more than 300 mm."
+                )
+        if all(value != "" for value in (l_val, w_val, t_val)):
+            if not (l_val >= w_val >= t_val):
+                raise ValueError(
+                    "Unusual dimensions: expected L >= W >= T. "
+                    "Check the fruit orientation and resend the measurements."
                 )
         if weight_val != "" and weight_val <= 0:
             raise ValueError("Weight must be greater than 0 g.")
@@ -648,8 +723,34 @@ class MangoRecorder(BoxLayout):
 
         self._refresh_count()
         self._set_status(f"Saved {self._record_description(*values[:3])}")
+        self._success_feedback()
         self.l_input.focus = True
         return True
+
+    def _success_feedback(self):
+        """Give hands-free confirmation without interrupting HID input."""
+        if platform != "android":
+            return
+        try:
+            from jnius import autoclass
+
+            Context = autoclass("android.content.Context")
+            PythonActivity = autoclass("org.kivy.android.PythonActivity")
+            activity = PythonActivity.mActivity
+            vibrator = activity.getSystemService(Context.VIBRATOR_SERVICE)
+            if vibrator is not None and vibrator.hasVibrator():
+                if int(autoclass("android.os.Build$VERSION").SDK_INT) >= 26:
+                    VibrationEffect = autoclass("android.os.VibrationEffect")
+                    vibrator.vibrate(
+                        VibrationEffect.createOneShot(
+                            80, VibrationEffect.DEFAULT_AMPLITUDE
+                        )
+                    )
+                else:
+                    vibrator.vibrate(80)
+        except Exception:
+            # Saving must never fail merely because feedback is unavailable.
+            traceback.print_exc()
 
     def clear_measurements(self):
         self.l_input.text = ""

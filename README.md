@@ -15,6 +15,18 @@ The on-screen fields are:
 - Weight (g)
 - Brix (°)
 
+Two collection modes are available:
+
+- **LWT only**: pressing Return/Data after T validates and saves the record,
+  increments a numeric PanicleID, vibrates briefly on Android, and returns focus
+  to L for the next fruit.
+- **LWT + Weight + Brix**: retains the complete field sequence and saves after
+  Brix.
+
+The selected mode is remembered between sessions. LWT-only mode requires all
+three dimensions. Dimension values must be in the existing valid range and are
+also checked for the expected `L >= W >= T` ordering before a record is saved.
+
 Exported CSV columns:
 
 ```text

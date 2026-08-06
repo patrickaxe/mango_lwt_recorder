@@ -4,7 +4,7 @@ package.name = mangolwtrecorder
 package.domain = au.edu.research
 source.dir = .
 source.include_exts = py,java,png,jpg,kv,atlas,csv,xml
-version = 0.2.2
+version = 0.2.3
 requirements = python3,kivy,pyjnius
 orientation = portrait
 fullscreen = 0
@@ -14,7 +14,7 @@ android.api = 35
 android.minapi = 24
 android.archs = arm64-v8a, armeabi-v7a
 android.accept_sdk_license = True
-android.permissions = READ_EXTERNAL_STORAGE, WRITE_EXTERNAL_STORAGE, RECORD_AUDIO
+android.permissions = READ_EXTERNAL_STORAGE, WRITE_EXTERNAL_STORAGE, RECORD_AUDIO, VIBRATE
 android.extra_manifest_xml = ./src/android/extra_manifest.xml
 android.add_src = src/android/java
 
