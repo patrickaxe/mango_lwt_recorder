@@ -33,7 +33,13 @@ jobs:
       - name: Install kivy-ios
         run: |
           python3 -m pip install --upgrade pip
+          python3 -m pip install "Cython<3.0"
           python3 -m pip install "kivy-ios==2025.5.17"
+
+          cython --version
+          toolchain --version || true
+
+     
 
       - name: Prepare iOS app source
         run: |
