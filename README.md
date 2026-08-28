@@ -14,6 +14,8 @@ The on-screen fields are:
 - T (mm)
 - Weight (g)
 - Brix (°)
+- SamplingRole (`Core`, `Reserve`, `Destructive`, `Observation`, or `Drop`)
+- Comment (optional)
 
 Two collection modes are available:
 
@@ -24,19 +26,28 @@ Two collection modes are available:
   Brix.
 
 The selected mode is remembered between sessions. LWT-only mode requires all
-three dimensions. Dimension values must be in the existing valid range and are
-also checked for the expected `L >= W >= T` ordering before a record is saved.
+three dimensions except when SamplingRole is `Drop`, which can be saved without
+L/W/T so naturally dropped, damaged, missing, or otherwise discontinued fruit can
+be recorded in the field. Dimension values must be in the existing valid range
+and are also checked for the expected `L >= W >= T` ordering before a record is
+saved.
+
+SamplingRole defaults to `Core` and is retained after SAVE & NEXT to make repeated
+cohort measurements fast. Comment is optional and is cleared after each saved
+record.
 
 Exported CSV columns:
 
 ```text
-Block,TreeID,PanicleID,L,W,T,Weight,Brix,Timestamp
+Block,TreeID,PanicleID,L,W,T,Weight,Brix,SamplingRole,Comment,Timestamp
 ```
 
 Data is saved immediately to a local SQLite database. Partially completed rows
 can be saved as long as at least one field has a value; only populated numeric
 fields are validated. Block and TreeID remain unchanged after saving. A numeric
-PanicleID automatically increases by one.
+PanicleID automatically increases by one. Existing local databases are migrated
+in place by adding nullable SamplingRole and Comment columns, so older records
+remain readable and export with blank values for the new fields.
 
 Records are grouped into worksheets. The worksheet selector changes the active
 worksheet; record counts, `UNDO LAST`, and CSV export apply only to the active
