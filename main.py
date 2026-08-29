@@ -153,6 +153,8 @@ class MangoRecorder(BoxLayout):
                 )
             if "comment" not in columns:
                 con.execute("ALTER TABLE measurements ADD COLUMN comment TEXT")
+            if "cultivar" not in columns:
+                con.execute("ALTER TABLE measurements ADD COLUMN cultivar TEXT")
 
             default_row = con.execute(
                 "SELECT id FROM worksheets ORDER BY id LIMIT 1"
@@ -313,6 +315,13 @@ class MangoRecorder(BoxLayout):
         self.block_input = self._field("e.g. B15")
         self.tree_input = self._field("e.g. 12")
         self.panicle_input = self._field("e.g. 1")
+        self.cultivar_spinner = Spinner(
+            text="Calypso",
+            values=("Calypso", "Other"),
+            font_size="17sp",
+            size_hint_y=None,
+            height=dp(54),
+        )
         self.l_input = self._field("Length (mm)", input_filter="float")
         self.w_input = self._field("Width (mm)", input_filter="float")
         self.t_input = self._field("Thickness (mm)", input_filter="float")
@@ -347,6 +356,7 @@ class MangoRecorder(BoxLayout):
             ("Block", self.block_input),
             ("TreeID", self.tree_input),
             ("PanicleID", self.panicle_input),
+            ("Cultivar", self.cultivar_spinner),
             ("L (mm)", self.l_input),
             ("W (mm)", self.w_input),
             ("T (mm)", self.t_input),
@@ -636,6 +646,7 @@ class MangoRecorder(BoxLayout):
         block = self.block_input.text.strip()
         tree_id = self.tree_input.text.strip()
         panicle_id = self.panicle_input.text.strip()
+        cultivar = self.cultivar_spinner.text.strip() or "Calypso"
         sampling_role = self.sampling_role_spinner.text.strip() or "Core"
         comment = self.comment_input.text.strip()
 
@@ -691,10 +702,24 @@ class MangoRecorder(BoxLayout):
                     f"{name} must be greater than 0 and no more than 300 mm."
                 )
         if all(value != "" for value in (l_val, w_val, t_val)):
-            if not (l_val >= w_val >= t_val):
+            if cultivar == "Calypso":
+                t_over_l = t_val / l_val
+                t_over_w = t_val / w_val
+                if not (
+                    0.5 <= t_over_l <= 1.0
+                    and 0.5 <= t_over_w <= 1.1
+                ):
+                    raise ValueError(
+                        "Unusual Calypso dimensions: expected "
+                        "0.5 <= T/L <= 1.0 and 0.5 <= T/W <= 1.1. "
+                        f"Got T/L={t_over_l:.2f}, T/W={t_over_w:.2f}. "
+                        "Check the fruit orientation and resend the measurements."
+                    )
+            elif not (l_val >= w_val >= t_val):
                 raise ValueError(
-                    "Unusual dimensions: expected L >= W >= T. "
-                    "Check the fruit orientation and resend the measurements."
+                    "Unusual dimensions for Other cultivar: expected "
+                    "L >= W >= T. Check the fruit orientation and resend "
+                    "the measurements."
                 )
         if weight_val != "" and weight_val <= 0:
             raise ValueError("Weight must be greater than 0 g.")
@@ -705,6 +730,7 @@ class MangoRecorder(BoxLayout):
             block,
             tree_id,
             panicle_id,
+            cultivar,
             l_val,
             w_val,
             t_val,
@@ -727,9 +753,9 @@ class MangoRecorder(BoxLayout):
             con.execute(
                 """
                 INSERT INTO measurements
-                (worksheet_id, block, tree_id, panicle_id, l, w, t,
+                (worksheet_id, block, tree_id, panicle_id, cultivar, l, w, t,
                  weight, brix, sampling_role, comment, recorded_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (self.active_worksheet_id, *values, self._timestamp()),
             )
@@ -1444,6 +1470,7 @@ class MangoRecorder(BoxLayout):
                 "Block",
                 "TreeID",
                 "PanicleID",
+                "Cultivar",
                 "L",
                 "W",
                 "T",
@@ -1459,7 +1486,7 @@ class MangoRecorder(BoxLayout):
             writer.writerows(
                 con.execute(
                     """
-                    SELECT block, tree_id, panicle_id, l, w, t,
+                    SELECT block, tree_id, panicle_id, cultivar, l, w, t,
                            weight, brix, sampling_role, comment, recorded_at
                     FROM measurements
                     WHERE worksheet_id = ?
