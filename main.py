@@ -147,6 +147,12 @@ class MangoRecorder(BoxLayout):
                 con.execute("ALTER TABLE measurements ADD COLUMN weight REAL")
             if "brix" not in columns:
                 con.execute("ALTER TABLE measurements ADD COLUMN brix REAL")
+            if "sampling_role" not in columns:
+                con.execute(
+                    "ALTER TABLE measurements ADD COLUMN sampling_role TEXT"
+                )
+            if "comment" not in columns:
+                con.execute("ALTER TABLE measurements ADD COLUMN comment TEXT")
 
             default_row = con.execute(
                 "SELECT id FROM worksheets ORDER BY id LIMIT 1"
@@ -312,6 +318,14 @@ class MangoRecorder(BoxLayout):
         self.t_input = self._field("Thickness (mm)", input_filter="float")
         self.weight_input = self._field("Weight (g)", input_filter="float")
         self.brix_input = self._field("Brix (degrees)", input_filter="float")
+        self.sampling_role_spinner = Spinner(
+            text="Core",
+            values=("Core", "Reserve", "Destructive", "Observation", "Drop"),
+            font_size="17sp",
+            size_hint_y=None,
+            height=dp(54),
+        )
+        self.comment_input = self._field("Optional comment", multiline=False)
         self.weight_input.disabled = self.collection_mode == self.MODE_LWT
         self.brix_input.disabled = self.collection_mode == self.MODE_LWT
         self.voice_command_input = self._field("Type/dictate command")
@@ -338,6 +352,8 @@ class MangoRecorder(BoxLayout):
             ("T (mm)", self.t_input),
             ("Weight (g)", self.weight_input),
             ("Brix (°)", self.brix_input),
+            ("SamplingRole", self.sampling_role_spinner),
+            ("Comment", self.comment_input),
             ("Voice control", voice_controls),
         ]
         for text, widget in rows:
@@ -620,6 +636,8 @@ class MangoRecorder(BoxLayout):
         block = self.block_input.text.strip()
         tree_id = self.tree_input.text.strip()
         panicle_id = self.panicle_input.text.strip()
+        sampling_role = self.sampling_role_spinner.text.strip() or "Core"
+        comment = self.comment_input.text.strip()
 
         raw_numbers = {
             "L": self.l_input.text.strip(),
@@ -651,7 +669,10 @@ class MangoRecorder(BoxLayout):
         weight_val = optional_number("Weight")
         brix_val = optional_number("Brix")
 
-        if self.collection_mode == self.MODE_LWT:
+        if (
+            self.collection_mode == self.MODE_LWT
+            and sampling_role != "Drop"
+        ):
             missing = [
                 name
                 for name, value in (("L", l_val), ("W", w_val), ("T", t_val))
@@ -689,6 +710,8 @@ class MangoRecorder(BoxLayout):
             t_val,
             weight_val,
             brix_val,
+            sampling_role,
+            comment,
         )
 
     def save_record(self, on_error_dismiss=None):
@@ -705,8 +728,8 @@ class MangoRecorder(BoxLayout):
                 """
                 INSERT INTO measurements
                 (worksheet_id, block, tree_id, panicle_id, l, w, t,
-                 weight, brix, recorded_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 weight, brix, sampling_role, comment, recorded_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (self.active_worksheet_id, *values, self._timestamp()),
             )
@@ -758,6 +781,7 @@ class MangoRecorder(BoxLayout):
         self.t_input.text = ""
         self.weight_input.text = ""
         self.brix_input.text = ""
+        self.comment_input.text = ""
         self.l_input.focus = True
 
     def clear_all_fields(self):
@@ -770,6 +794,7 @@ class MangoRecorder(BoxLayout):
             self.t_input,
             self.weight_input,
             self.brix_input,
+            self.comment_input,
             self.voice_command_input,
         ):
             field.text = ""
@@ -1424,6 +1449,8 @@ class MangoRecorder(BoxLayout):
                 "T",
                 "Weight",
                 "Brix",
+                "SamplingRole",
+                "Comment",
                 "Timestamp",
             ]
         )
@@ -1433,7 +1460,7 @@ class MangoRecorder(BoxLayout):
                 con.execute(
                     """
                     SELECT block, tree_id, panicle_id, l, w, t,
-                           weight, brix, recorded_at
+                           weight, brix, sampling_role, comment, recorded_at
                     FROM measurements
                     WHERE worksheet_id = ?
                     ORDER BY id
