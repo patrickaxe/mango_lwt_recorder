@@ -6,16 +6,17 @@ A small offline-first research data collection app written in Python/Kivy.
 
 The on-screen fields are:
 
-- Block
-- TreeID
-- PanicleID
-- Cultivar (`Calypso` or `Other`)
+- Block (required)
+- TreeID (required)
+- PanicleID (required)
+- Cultivar (`Calypso` or `Other`, optional)
 - L (mm)
 - W (mm)
 - T (mm)
 - Weight (g)
 - Brix (°)
-- SamplingRole (`Core`, `Reserve`, `Destructive`, `Observation`, or `Drop`)
+- SamplingRole (`Core`, `Reserve`, `Destructive`, `Observation`, `Drop`, or
+  `Replaced`; optional)
 - Comment (optional)
 
 Two collection modes are available:
@@ -26,13 +27,12 @@ Two collection modes are available:
 - **LWT + Weight + Brix**: retains the complete field sequence and saves after
   Brix.
 
-The selected mode is remembered between sessions. LWT-only mode requires all
-three dimensions except when SamplingRole is `Drop`, which can be saved without
-L/W/T so naturally dropped, damaged, missing, or otherwise discontinued fruit can
-be recorded in the field. Dimension values must be in the existing valid range.
-For `Calypso`, shape validation checks `0.5 <= T/L <= 1.0` and
-`0.5 <= T/W <= 1.1`. For `Other`, the existing `L >= W >= T` orientation
-check is retained.
+The selected mode is remembered between sessions. Block, TreeID, and PanicleID
+must be present on every saved record. All other fields are optional, including
+L/W/T in LWT-only mode. Populated dimension values must be in the existing valid
+range. When all three dimensions are present, `Calypso` shape validation checks
+`0.5 <= T/L <= 1.0` and `0.5 <= T/W <= 1.1`; `Other` uses the existing
+`L >= W >= T` orientation check.
 
 SamplingRole defaults to `Core` and is retained after SAVE & NEXT to make repeated
 cohort measurements fast. Comment is optional and is cleared after each saved
@@ -44,18 +44,33 @@ Exported CSV columns:
 Block,TreeID,PanicleID,Cultivar,L,W,T,Weight,Brix,SamplingRole,Comment,Timestamp
 ```
 
-Data is saved immediately to a local SQLite database. Partially completed rows
-can be saved as long as at least one field has a value; only populated numeric
-fields are validated. Block and TreeID remain unchanged after saving. A numeric
-PanicleID automatically increases by one. Existing local databases are migrated
-in place by adding nullable SamplingRole, Comment, and Cultivar columns, so older
-records remain readable and export with blank values for fields that did not exist
-when they were recorded.
+Data is saved immediately to a local SQLite database. Only populated numeric
+fields are validated. In a manual worksheet, Block and TreeID remain unchanged
+after saving and a numeric PanicleID automatically increases by one. Existing
+local databases are migrated in place, so older records remain readable and
+export with blank values for fields that did not exist when they were recorded.
 
 Records are grouped into worksheets. The worksheet selector changes the active
 worksheet; record counts, `UNDO LAST`, and CSV export apply only to the active
 worksheet. Use `NEW` to create and name a fresh worksheet without deleting the
 older worksheets.
+
+## Worksheet templates
+
+Tap **IMPORT CSV** to create a worksheet from a CSV template. A valid template
+must have `Block`, `TreeID`, and `PanicleID` columns, and every nonblank row must
+contain values for those three fields. The remaining supported columns are
+optional: `Cultivar`, `L`, `W`, `T`, `Weight`, `Brix`, `SamplingRole`, and
+`Comment`. A `Timestamp` column is allowed but is ignored because the app records
+the actual save time.
+
+Template rows are not counted as collected measurements. The app displays and
+prefills the next unfinished template row; **SAVE & NEXT** records it and advances
+to the next row. Undoing a template record makes that row available again.
+
+`FruitSizingTemp.csv` is bundled with the app as an example. Tap **USE EXAMPLE**
+to create a new worksheet from it. Importing a template is optional; ordinary
+worksheets continue to support manual collection.
 
 CSV exports are saved to the device Downloads folder. On Android this is:
 

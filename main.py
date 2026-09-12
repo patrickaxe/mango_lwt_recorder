@@ -17,12 +17,15 @@ from kivy.properties import NumericProperty, StringProperty
 from kivy.utils import escape_markup, platform
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.button import Button
+from kivy.uix.filechooser import FileChooserListView
 from kivy.uix.gridlayout import GridLayout
 from kivy.uix.label import Label
 from kivy.uix.popup import Popup
 from kivy.uix.scrollview import ScrollView
 from kivy.uix.spinner import Spinner
 from kivy.uix.textinput import TextInput
+
+from template_csv import OPTIONAL_TEMPLATE_COLUMNS, parse_template_csv
 
 if platform == "android":
     from android.runnable import run_on_ui_thread
@@ -60,6 +63,8 @@ def create_android_speech_callback(on_event):
 class MangoRecorder(BoxLayout):
     MODE_LWT = "LWT only"
     MODE_FULL = "LWT + Weight + Brix"
+    EXAMPLE_TEMPLATE_FILENAME = "FruitSizingTemp.csv"
+    ANDROID_TEMPLATE_REQUEST_CODE = 24681
     VOICE_DELETE_COMMANDS = {"delete last record", "delete the last record"}
     VOICE_NEXT_FIELD_COMMANDS = {"next field"}
     VOICE_NEXT_FRUIT_COMMANDS = {"next fruit", "save and next", "save next"}
@@ -88,11 +93,14 @@ class MangoRecorder(BoxLayout):
         self._audio_permission_callback = None
         self._focused_data_index = 0
         self._updating_worksheet_spinner = False
+        self._active_template_row_id = None
+        self._android_template_picker_bound = False
         self.collection_mode = self.MODE_LWT
         self._init_database()
         self._load_active_worksheet()
         self._load_collection_mode()
         self._build_ui()
+        self._load_template_target()
         self._refresh_count()
         Clock.schedule_once(lambda _dt: setattr(self.block_input, "focus", True), 0.4)
         Clock.schedule_once(lambda _dt: self._request_storage_permissions(), 0.8)
@@ -134,6 +142,28 @@ class MangoRecorder(BoxLayout):
                 )
                 """
             )
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS worksheet_template_rows (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    worksheet_id INTEGER NOT NULL
+                        REFERENCES worksheets(id) ON DELETE CASCADE,
+                    row_number INTEGER NOT NULL,
+                    block TEXT NOT NULL,
+                    tree_id TEXT NOT NULL,
+                    panicle_id TEXT NOT NULL,
+                    cultivar TEXT,
+                    l TEXT,
+                    w TEXT,
+                    t TEXT,
+                    weight TEXT,
+                    brix TEXT,
+                    sampling_role TEXT,
+                    comment TEXT,
+                    UNIQUE (worksheet_id, row_number)
+                )
+                """
+            )
 
             columns = {
                 row[1] for row in con.execute("PRAGMA table_info(measurements)")
@@ -155,6 +185,20 @@ class MangoRecorder(BoxLayout):
                 con.execute("ALTER TABLE measurements ADD COLUMN comment TEXT")
             if "cultivar" not in columns:
                 con.execute("ALTER TABLE measurements ADD COLUMN cultivar TEXT")
+            if "template_row_id" not in columns:
+                con.execute(
+                    "ALTER TABLE measurements ADD COLUMN template_row_id INTEGER "
+                    "REFERENCES worksheet_template_rows(id)"
+                )
+
+            con.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS
+                    measurements_template_row_id_unique
+                ON measurements(template_row_id)
+                WHERE template_row_id IS NOT NULL
+                """
+            )
 
             default_row = con.execute(
                 "SELECT id FROM worksheets ORDER BY id LIMIT 1"
@@ -290,6 +334,46 @@ class MangoRecorder(BoxLayout):
         self.add_widget(worksheet_bar)
         self._refresh_worksheet_selector()
 
+        template_bar = BoxLayout(
+            orientation="horizontal", spacing=dp(8), size_hint_y=None, height=dp(50)
+        )
+        template_bar.add_widget(
+            Label(
+                text="[b]Template[/b]",
+                markup=True,
+                font_size="17sp",
+                size_hint_x=0.25,
+            )
+        )
+        example_template_btn = Button(
+            text="USE EXAMPLE", font_size="15sp", size_hint_x=0.375
+        )
+        example_template_btn.bind(
+            on_release=lambda *_: self.load_example_template()
+        )
+        import_template_btn = Button(
+            text="IMPORT CSV", font_size="15sp", size_hint_x=0.375
+        )
+        import_template_btn.bind(
+            on_release=lambda *_: self.choose_template_csv()
+        )
+        template_bar.add_widget(example_template_btn)
+        template_bar.add_widget(import_template_btn)
+        self.add_widget(template_bar)
+
+        self.template_status = Label(
+            text="Manual worksheet: Block, TreeID, and PanicleID are required.",
+            size_hint_y=None,
+            height=dp(42),
+            font_size="14sp",
+            halign="center",
+            valign="middle",
+        )
+        self.template_status.bind(
+            size=lambda inst, value: setattr(inst, "text_size", value)
+        )
+        self.add_widget(self.template_status)
+
         mode_bar = BoxLayout(
             orientation="horizontal", spacing=dp(8), size_hint_y=None, height=dp(50)
         )
@@ -317,7 +401,7 @@ class MangoRecorder(BoxLayout):
         self.panicle_input = self._field("e.g. 1")
         self.cultivar_spinner = Spinner(
             text="Calypso",
-            values=("Calypso", "Other"),
+            values=("", "Calypso", "Other"),
             font_size="17sp",
             size_hint_y=None,
             height=dp(54),
@@ -329,7 +413,15 @@ class MangoRecorder(BoxLayout):
         self.brix_input = self._field("Brix (degrees)", input_filter="float")
         self.sampling_role_spinner = Spinner(
             text="Core",
-            values=("Core", "Reserve", "Destructive", "Observation", "Drop"),
+            values=(
+                "",
+                "Core",
+                "Reserve",
+                "Destructive",
+                "Observation",
+                "Drop",
+                "Replaced",
+            ),
             font_size="17sp",
             size_hint_y=None,
             height=dp(54),
@@ -536,7 +628,7 @@ class MangoRecorder(BoxLayout):
             )
             con.commit()
 
-        self.clear_all_fields()
+        self._load_template_target()
         self._refresh_count()
         self._set_status(f"Switched to {worksheet_name}")
 
@@ -612,10 +704,383 @@ class MangoRecorder(BoxLayout):
 
         self.active_worksheet_id = worksheet_id
         self.active_worksheet_name = name
-        self.clear_all_fields()
+        self._load_template_target()
         self._refresh_worksheet_selector()
         self._refresh_count()
         self._set_status(f"Created {name}")
+
+    def _unique_worksheet_name(self, requested_name):
+        base_name = " ".join(requested_name.strip().split()) or "Imported template"
+        base_name = base_name[:60].rstrip()
+        existing = {name.casefold() for _, name in self._worksheet_rows()}
+        if base_name.casefold() not in existing:
+            return base_name
+
+        number = 2
+        while True:
+            suffix = f" ({number})"
+            candidate = base_name[: 60 - len(suffix)].rstrip() + suffix
+            if candidate.casefold() not in existing:
+                return candidate
+            number += 1
+
+    def import_template_text(self, csv_text, requested_name):
+        worksheet_id, worksheet_name, row_count = self._store_template_text(
+            csv_text, requested_name
+        )
+        self._activate_template_worksheet(worksheet_id, worksheet_name, row_count)
+        return row_count
+
+    def _store_template_text(self, csv_text, requested_name):
+        rows = parse_template_csv(csv_text)
+        worksheet_name = self._unique_worksheet_name(requested_name)
+
+        with sqlite3.connect(self.db_path) as con:
+            con.execute("PRAGMA foreign_keys = ON")
+            cursor = con.execute(
+                "INSERT INTO worksheets (name, created_at) VALUES (?, ?)",
+                (worksheet_name, self._timestamp()),
+            )
+            worksheet_id = cursor.lastrowid
+            con.executemany(
+                """
+                INSERT INTO worksheet_template_rows
+                    (worksheet_id, row_number, block, tree_id, panicle_id,
+                     cultivar, l, w, t, weight, brix, sampling_role, comment)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        worksheet_id,
+                        row_number,
+                        row["Block"],
+                        row["TreeID"],
+                        row["PanicleID"],
+                        *(row[column] for column in OPTIONAL_TEMPLATE_COLUMNS),
+                    )
+                    for row_number, row in enumerate(rows, start=1)
+                ],
+            )
+            con.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                ("active_worksheet_id", str(worksheet_id)),
+            )
+            con.commit()
+
+        return worksheet_id, worksheet_name, len(rows)
+
+    def _activate_template_worksheet(
+        self, worksheet_id, worksheet_name, row_count
+    ):
+        self.active_worksheet_id = worksheet_id
+        self.active_worksheet_name = worksheet_name
+        self._refresh_worksheet_selector()
+        self._refresh_count()
+        self._load_template_target()
+        self._set_status(f"Imported template: {worksheet_name} ({row_count} rows)")
+
+    def _load_template_target(self):
+        with sqlite3.connect(self.db_path) as con:
+            total = con.execute(
+                """
+                SELECT COUNT(*)
+                FROM worksheet_template_rows
+                WHERE worksheet_id = ?
+                """,
+                (self.active_worksheet_id,),
+            ).fetchone()[0]
+            completed = con.execute(
+                """
+                SELECT COUNT(*)
+                FROM worksheet_template_rows AS template
+                JOIN measurements AS measurement
+                  ON measurement.template_row_id = template.id
+                WHERE template.worksheet_id = ?
+                """,
+                (self.active_worksheet_id,),
+            ).fetchone()[0]
+            row = con.execute(
+                """
+                SELECT template.id, template.row_number, template.block,
+                       template.tree_id, template.panicle_id, template.cultivar,
+                       template.l, template.w, template.t, template.weight,
+                       template.brix, template.sampling_role, template.comment
+                FROM worksheet_template_rows AS template
+                LEFT JOIN measurements AS measurement
+                  ON measurement.template_row_id = template.id
+                WHERE template.worksheet_id = ? AND measurement.id IS NULL
+                ORDER BY template.row_number
+                LIMIT 1
+                """,
+                (self.active_worksheet_id,),
+            ).fetchone()
+
+        self.clear_all_fields()
+        self._active_template_row_id = None
+        for identifier_field in (
+            self.block_input,
+            self.tree_input,
+            self.panicle_input,
+        ):
+            identifier_field.readonly = False
+        if total == 0:
+            self.cultivar_spinner.text = "Calypso"
+            self.sampling_role_spinner.text = "Core"
+            self.template_status.text = (
+                "Manual worksheet: Block, TreeID, and PanicleID are required."
+            )
+            return
+        if row is None:
+            self.cultivar_spinner.text = ""
+            self.sampling_role_spinner.text = ""
+            self.template_status.text = (
+                f"Template complete: {completed}/{total} rows saved."
+            )
+            return
+
+        (
+            self._active_template_row_id,
+            row_number,
+            block,
+            tree_id,
+            panicle_id,
+            cultivar,
+            l_value,
+            w_value,
+            t_value,
+            weight,
+            brix,
+            sampling_role,
+            comment,
+        ) = row
+        self.block_input.text = block
+        self.tree_input.text = tree_id
+        self.panicle_input.text = panicle_id
+        for identifier_field in (
+            self.block_input,
+            self.tree_input,
+            self.panicle_input,
+        ):
+            identifier_field.readonly = True
+        self.cultivar_spinner.text = cultivar or ""
+        self.l_input.text = l_value or ""
+        self.w_input.text = w_value or ""
+        self.t_input.text = t_value or ""
+        self.weight_input.text = weight or ""
+        self.brix_input.text = brix or ""
+        self.sampling_role_spinner.text = sampling_role or ""
+        self.comment_input.text = comment or ""
+        self.template_status.text = (
+            f"Template row {row_number}/{total} | Saved {completed}/{total} | "
+            f"Block {block} / Tree {tree_id} / Panicle {panicle_id}"
+        )
+        self.l_input.focus = True
+
+    def load_example_template(self):
+        template_path = Path(__file__).resolve().parent / self.EXAMPLE_TEMPLATE_FILENAME
+        try:
+            csv_text = template_path.read_text(encoding="utf-8-sig")
+            row_count = self.import_template_text(
+                csv_text, template_path.stem
+            )
+        except Exception as exc:
+            self._set_status("Example template import failed")
+            self._show_message(
+                "Example template import failed",
+                f"Could not load {self.EXAMPLE_TEMPLATE_FILENAME}:\n{exc}",
+            )
+            return
+
+        self._show_message(
+            "Example template ready",
+            f"Created worksheet {self.active_worksheet_name} with "
+            f"{row_count} template rows.",
+        )
+
+    def choose_template_csv(self):
+        if platform == "android":
+            self._choose_android_template_csv()
+        else:
+            self._choose_desktop_template_csv()
+
+    def _choose_desktop_template_csv(self):
+        start_path = self.download_dir if self.download_dir.exists() else Path.home()
+        chooser = FileChooserListView(
+            path=str(start_path), filters=["*.csv"], multiselect=False
+        )
+        actions = BoxLayout(
+            orientation="horizontal", spacing=dp(8), size_hint_y=None, height=dp(48)
+        )
+        cancel = Button(text="CANCEL")
+        import_button = Button(text="IMPORT")
+        actions.add_widget(cancel)
+        actions.add_widget(import_button)
+        content = BoxLayout(orientation="vertical", padding=dp(8), spacing=dp(8))
+        content.add_widget(chooser)
+        content.add_widget(actions)
+        popup = Popup(
+            title="Import worksheet template",
+            content=content,
+            size_hint=(0.94, 0.9),
+        )
+
+        def import_selection(*_args):
+            if not chooser.selection:
+                self._show_message("Import template", "Select a CSV file first.")
+                return
+            selected_path = Path(chooser.selection[0])
+            try:
+                csv_text = selected_path.read_text(encoding="utf-8-sig")
+                row_count = self.import_template_text(csv_text, selected_path.stem)
+            except Exception as exc:
+                popup.dismiss()
+                self._set_status("Template import failed")
+                self._show_message("Template import failed", str(exc))
+                return
+            popup.dismiss()
+            self._show_message(
+                "Template ready",
+                f"Created worksheet {self.active_worksheet_name} with "
+                f"{row_count} template rows.",
+            )
+
+        cancel.bind(on_release=popup.dismiss)
+        import_button.bind(on_release=import_selection)
+        chooser.bind(on_submit=lambda *_: import_selection())
+        popup.open()
+
+    @run_on_ui_thread
+    def _choose_android_template_csv(self):
+        from android import activity
+        from jnius import autoclass
+
+        Intent = autoclass("android.content.Intent")
+        PythonActivity = autoclass("org.kivy.android.PythonActivity")
+
+        if self._android_template_picker_bound:
+            activity.unbind(on_activity_result=self._on_android_template_result)
+        activity.bind(on_activity_result=self._on_android_template_result)
+        self._android_template_picker_bound = True
+
+        intent = Intent(Intent.ACTION_OPEN_DOCUMENT)
+        intent.addCategory(Intent.CATEGORY_OPENABLE)
+        intent.setType("text/*")
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        PythonActivity.mActivity.startActivityForResult(
+            intent, self.ANDROID_TEMPLATE_REQUEST_CODE
+        )
+
+    def _on_android_template_result(self, request_code, result_code, intent):
+        if request_code != self.ANDROID_TEMPLATE_REQUEST_CODE:
+            return
+
+        from android import activity
+
+        if self._android_template_picker_bound:
+            activity.unbind(on_activity_result=self._on_android_template_result)
+            self._android_template_picker_bound = False
+        if intent is None:
+            return
+
+        try:
+            from jnius import autoclass
+
+            Activity = autoclass("android.app.Activity")
+            if result_code != Activity.RESULT_OK:
+                return
+            uri = intent.getData()
+            if uri is None:
+                return
+            csv_text, display_name = self._read_android_document(uri)
+            worksheet_name = Path(display_name).stem if display_name else "Imported template"
+        except Exception as exc:
+            detail = str(exc)
+            Clock.schedule_once(
+                lambda _dt, message=detail:
+                self._report_template_import_failure(message),
+                0,
+            )
+            return
+
+        # Android activity results do not run in Kivy's event-loop context.
+        # Defer all database-to-widget synchronization and popup work to the
+        # next Kivy frame.
+        Clock.schedule_once(
+            lambda _dt, text=csv_text, name=worksheet_name:
+            self._finish_android_template_import(text, name),
+            0,
+        )
+
+    def _finish_android_template_import(self, csv_text, worksheet_name):
+        try:
+            worksheet_id, stored_name, row_count = self._store_template_text(
+                csv_text, worksheet_name
+            )
+        except Exception as exc:
+            self._report_template_import_failure(str(exc))
+            return
+
+        try:
+            self._activate_template_worksheet(
+                worksheet_id, stored_name, row_count
+            )
+        except Exception as exc:
+            # The transaction has already committed. Report the refresh problem
+            # accurately instead of claiming that the CSV import failed.
+            self.active_worksheet_id = worksheet_id
+            self.active_worksheet_name = stored_name
+            self._show_message(
+                "Template imported",
+                f"Created worksheet {stored_name} with {row_count} rows, but "
+                f"the screen could not refresh. Reopen the worksheet or restart "
+                f"the app.\n\nRefresh error: {exc}",
+            )
+            return
+
+        self._show_message(
+            "Template ready",
+            f"Created worksheet {self.active_worksheet_name} with "
+            f"{row_count} template rows.",
+        )
+
+    def _report_template_import_failure(self, message):
+        self._set_status("Template import failed")
+        self._show_message("Template import failed", message)
+
+    @staticmethod
+    def _read_android_document(uri):
+        from jnius import autoclass
+
+        BufferedReader = autoclass("java.io.BufferedReader")
+        InputStreamReader = autoclass("java.io.InputStreamReader")
+        OpenableColumns = autoclass("android.provider.OpenableColumns")
+        PythonActivity = autoclass("org.kivy.android.PythonActivity")
+
+        resolver = PythonActivity.mActivity.getContentResolver()
+        display_name = "Imported template.csv"
+        cursor = resolver.query(uri, None, None, None, None)
+        if cursor is not None:
+            try:
+                name_index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                if cursor.moveToFirst() and name_index >= 0:
+                    display_name = str(cursor.getString(name_index))
+            finally:
+                cursor.close()
+
+        stream = resolver.openInputStream(uri)
+        if stream is None:
+            raise OSError("Android could not open the selected CSV file.")
+        reader = BufferedReader(InputStreamReader(stream, "UTF-8"))
+        lines = []
+        try:
+            while True:
+                line = reader.readLine()
+                if line is None:
+                    break
+                lines.append(str(line))
+        finally:
+            reader.close()
+        return "\n".join(lines), display_name
 
     def _download_dir(self):
         if platform == "android":
@@ -646,9 +1111,25 @@ class MangoRecorder(BoxLayout):
         block = self.block_input.text.strip()
         tree_id = self.tree_input.text.strip()
         panicle_id = self.panicle_input.text.strip()
-        cultivar = self.cultivar_spinner.text.strip() or "Calypso"
-        sampling_role = self.sampling_role_spinner.text.strip() or "Core"
+        cultivar = self.cultivar_spinner.text.strip()
+        sampling_role = self.sampling_role_spinner.text.strip()
         comment = self.comment_input.text.strip()
+
+        missing_identifiers = [
+            name
+            for name, value in (
+                ("Block", block),
+                ("TreeID", tree_id),
+                ("PanicleID", panicle_id),
+            )
+            if not value
+        ]
+        if missing_identifiers:
+            raise ValueError(
+                "Required field(s) missing: "
+                + ", ".join(missing_identifiers)
+                + "."
+            )
 
         raw_numbers = {
             "L": self.l_input.text.strip(),
@@ -657,9 +1138,6 @@ class MangoRecorder(BoxLayout):
             "Weight": self.weight_input.text.strip(),
             "Brix": self.brix_input.text.strip(),
         }
-        if not any((block, tree_id, panicle_id, *raw_numbers.values())):
-            raise ValueError("Enter at least one value before saving.")
-
         def optional_number(name):
             raw_value = raw_numbers[name]
             if not raw_value:
@@ -680,22 +1158,6 @@ class MangoRecorder(BoxLayout):
         weight_val = optional_number("Weight")
         brix_val = optional_number("Brix")
 
-        if (
-            self.collection_mode == self.MODE_LWT
-            and sampling_role != "Drop"
-        ):
-            missing = [
-                name
-                for name, value in (("L", l_val), ("W", w_val), ("T", t_val))
-                if value == ""
-            ]
-            if missing:
-                raise ValueError(
-                    "LWT-only mode requires all three measurements. Missing: "
-                    + ", ".join(missing)
-                    + "."
-                )
-
         for name, value in (("L", l_val), ("W", w_val), ("T", t_val)):
             if value != "" and (value <= 0 or value > 300):
                 raise ValueError(
@@ -715,7 +1177,7 @@ class MangoRecorder(BoxLayout):
                         f"Got T/L={t_over_l:.2f}, T/W={t_over_w:.2f}. "
                         "Check the fruit orientation and resend the measurements."
                     )
-            elif not (l_val >= w_val >= t_val):
+            elif cultivar == "Other" and not (l_val >= w_val >= t_val):
                 raise ValueError(
                     "Unusual dimensions for Other cultivar: expected "
                     "L >= W >= T. Check the fruit orientation and resend "
@@ -749,26 +1211,36 @@ class MangoRecorder(BoxLayout):
             )
             return False
 
+        template_row_id = self._active_template_row_id
         with sqlite3.connect(self.db_path) as con:
             con.execute(
                 """
                 INSERT INTO measurements
                 (worksheet_id, block, tree_id, panicle_id, cultivar, l, w, t,
-                 weight, brix, sampling_role, comment, recorded_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 weight, brix, sampling_role, comment, recorded_at,
+                 template_row_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (self.active_worksheet_id, *values, self._timestamp()),
+                (
+                    self.active_worksheet_id,
+                    *values,
+                    self._timestamp(),
+                    template_row_id,
+                ),
             )
             con.commit()
 
-        old_panicle = self.panicle_input.text.strip()
-        self.clear_measurements()
+        if template_row_id is not None:
+            self._load_template_target()
+        else:
+            old_panicle = self.panicle_input.text.strip()
+            self.clear_measurements()
 
-        # Auto-increment numeric PanicleID; otherwise retain it for manual editing.
-        try:
-            self.panicle_input.text = str(int(old_panicle) + 1)
-        except ValueError:
-            self.panicle_input.text = old_panicle
+            # Auto-increment numeric PanicleID for a manual worksheet.
+            try:
+                self.panicle_input.text = str(int(old_panicle) + 1)
+            except ValueError:
+                self.panicle_input.text = old_panicle
 
         self._refresh_count()
         self._set_status(f"Saved {self._record_description(*values[:3])}")
@@ -1316,7 +1788,7 @@ class MangoRecorder(BoxLayout):
         with sqlite3.connect(self.db_path) as con:
             return con.execute(
                 """
-                SELECT id, block, tree_id, panicle_id
+                SELECT id, block, tree_id, panicle_id, template_row_id
                 FROM measurements
                 WHERE worksheet_id = ?
                 ORDER BY id DESC LIMIT 1
@@ -1340,8 +1812,10 @@ class MangoRecorder(BoxLayout):
             return
         self._delete_record(row[0])
 
+        if row[4] is not None:
+            self._load_template_target()
         self._refresh_count()
-        self._set_status(f"Removed {self._record_description(*row[1:])}")
+        self._set_status(f"Removed {self._record_description(*row[1:4])}")
 
     def request_voice_delete(self, resume_voice=False):
         self.voice_command_input.text = ""
@@ -1360,7 +1834,7 @@ class MangoRecorder(BoxLayout):
 
         message = (
             "Delete the last record?\n\n"
-            f"{self._record_description(*row[1:])}\n\n"
+            f"{self._record_description(*row[1:4])}\n\n"
             "This action cannot be undone."
         )
         self._show_confirmation(
@@ -1382,9 +1856,11 @@ class MangoRecorder(BoxLayout):
                 "Voice delete", "That record has already been removed."
             )
             return
+        if row[4] is not None:
+            self._load_template_target()
         self._refresh_count()
         self._set_status(
-            f"Voice deleted {self._record_description(*row[1:])}"
+            f"Voice deleted {self._record_description(*row[1:4])}"
         )
 
     def request_delete_all_history(self):
@@ -1430,8 +1906,8 @@ class MangoRecorder(BoxLayout):
 
         self.active_worksheet_id = worksheet_id
         self.active_worksheet_name = "Worksheet 1"
-        self.clear_all_fields()
         self._refresh_worksheet_selector()
+        self._load_template_target()
         self._refresh_count()
         self._set_status("All history deleted")
 
