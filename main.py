@@ -62,7 +62,10 @@ def create_android_speech_callback(on_event):
 
 class MangoRecorder(BoxLayout):
     MODE_LWT = "LWT only"
+    MODE_WEIGHT = "Weight only"
+    MODE_BRIX = "Brix only"
     MODE_FULL = "LWT + Weight + Brix"
+    COLLECTION_MODES = (MODE_LWT, MODE_WEIGHT, MODE_BRIX, MODE_FULL)
     EXAMPLE_TEMPLATE_FILENAME = "FruitSizingTemp.csv"
     ANDROID_TEMPLATE_REQUEST_CODE = 24681
     VOICE_DELETE_COMMANDS = {"delete last record", "delete the last record"}
@@ -96,9 +99,11 @@ class MangoRecorder(BoxLayout):
         self._active_template_row_id = None
         self._android_template_picker_bound = False
         self.collection_mode = self.MODE_LWT
+        self.weight_factor = ""
         self._init_database()
         self._load_active_worksheet()
         self._load_collection_mode()
+        self._load_weight_factor()
         self._build_ui()
         self._load_template_target()
         self._refresh_count()
@@ -137,6 +142,7 @@ class MangoRecorder(BoxLayout):
                     w REAL,
                     t REAL,
                     weight REAL,
+                    predicted_weight REAL,
                     brix REAL,
                     recorded_at TEXT NOT NULL
                 )
@@ -175,6 +181,16 @@ class MangoRecorder(BoxLayout):
                 )
             if "weight" not in columns:
                 con.execute("ALTER TABLE measurements ADD COLUMN weight REAL")
+            if "predicted_weight" not in columns:
+                con.execute(
+                    "ALTER TABLE measurements ADD COLUMN predicted_weight REAL"
+                )
+            if "predicated_weight" in columns:
+                con.execute(
+                    "UPDATE measurements "
+                    "SET predicted_weight = predicated_weight / 1000.0 "
+                    "WHERE predicted_weight IS NULL"
+                )
             if "brix" not in columns:
                 con.execute("ALTER TABLE measurements ADD COLUMN brix REAL")
             if "sampling_role" not in columns:
@@ -273,8 +289,16 @@ class MangoRecorder(BoxLayout):
             row = con.execute(
                 "SELECT value FROM settings WHERE key = 'collection_mode'"
             ).fetchone()
-        if row is not None and row[0] in (self.MODE_LWT, self.MODE_FULL):
+        if row is not None and row[0] in self.COLLECTION_MODES:
             self.collection_mode = row[0]
+
+    def _load_weight_factor(self):
+        with sqlite3.connect(self.db_path) as con:
+            row = con.execute(
+                "SELECT value FROM settings WHERE key = 'weight_factor_k'"
+            ).fetchone()
+        if row is not None:
+            self.weight_factor = row[0]
 
     def _field(self, hint, multiline=False, input_filter=None):
         field = TextInput(
@@ -384,7 +408,7 @@ class MangoRecorder(BoxLayout):
         )
         self.mode_spinner = Spinner(
             text=self.collection_mode,
-            values=(self.MODE_LWT, self.MODE_FULL),
+            values=self.COLLECTION_MODES,
             font_size="17sp",
             size_hint_x=0.75,
         )
@@ -409,7 +433,11 @@ class MangoRecorder(BoxLayout):
         self.l_input = self._field("Length (mm)", input_filter="float")
         self.w_input = self._field("Width (mm)", input_filter="float")
         self.t_input = self._field("Thickness (mm)", input_filter="float")
+        self.k_input = self._field("Custom weight factor", input_filter="float")
+        self.k_input.text = self.weight_factor
         self.weight_input = self._field("Weight (g)", input_filter="float")
+        self.predicted_weight_input = self._field("Calculated value")
+        self.predicted_weight_input.readonly = True
         self.brix_input = self._field("Brix (degrees)", input_filter="float")
         self.sampling_role_spinner = Spinner(
             text="Core",
@@ -427,13 +455,15 @@ class MangoRecorder(BoxLayout):
             height=dp(54),
         )
         self.comment_input = self._field("Optional comment", multiline=False)
-        self.weight_input.disabled = self.collection_mode == self.MODE_LWT
-        self.brix_input.disabled = self.collection_mode == self.MODE_LWT
+        self._apply_collection_mode_state(clear_irrelevant=True)
         self.voice_command_input = self._field("Type/dictate command")
         self.voice_command_input.font_size = "14sp"
         self.voice_command_input.size_hint_x = 0.58
         self.voice_command_input.bind(text=self._on_voice_command_text)
         self.voice_command_input.bind(on_text_validate=self._submit_voice_command)
+        self.k_input.bind(text=self._on_weight_factor_changed)
+        for dimension_input in (self.l_input, self.w_input, self.t_input):
+            dimension_input.bind(text=self._update_calculated_weight)
         self.voice_toggle_btn = Button(
             text="START VOICE", font_size="13sp", size_hint_x=0.42
         )
@@ -449,10 +479,12 @@ class MangoRecorder(BoxLayout):
             ("TreeID", self.tree_input),
             ("PanicleID", self.panicle_input),
             ("Cultivar", self.cultivar_spinner),
+            ("k", self.k_input),
             ("L (mm)", self.l_input),
             ("W (mm)", self.w_input),
             ("T (mm)", self.t_input),
             ("Weight (g)", self.weight_input),
+            ("Predicted_Weight (g)", self.predicted_weight_input),
             ("Brix (°)", self.brix_input),
             ("SamplingRole", self.sampling_role_spinner),
             ("Comment", self.comment_input),
@@ -480,6 +512,7 @@ class MangoRecorder(BoxLayout):
             self.block_input,
             self.tree_input,
             self.panicle_input,
+            self.k_input,
             self.l_input,
             self.w_input,
             self.t_input,
@@ -491,6 +524,7 @@ class MangoRecorder(BoxLayout):
             "Block",
             "TreeID",
             "PanicleID",
+            "k",
             "L",
             "W",
             "T",
@@ -545,18 +579,87 @@ class MangoRecorder(BoxLayout):
         self.status.bind(size=lambda inst, value: setattr(inst, "text_size", value))
         self.add_widget(self.status)
 
+    @staticmethod
+    def _calculated_weight_text(l_text, w_text, t_text, k_text):
+        try:
+            values = tuple(
+                float(value.strip())
+                for value in (l_text, w_text, t_text, k_text)
+            )
+        except (AttributeError, TypeError, ValueError):
+            return ""
+        if any(not math.isfinite(value) or value <= 0 for value in values):
+            return ""
+        weight = math.prod(values) / 1000
+        if not math.isfinite(weight):
+            return ""
+        return format(weight, ".10g")
+
+    def _on_weight_factor_changed(self, _field, value):
+        self.weight_factor = value.strip()
+        with sqlite3.connect(self.db_path) as con:
+            con.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                ("weight_factor_k", self.weight_factor),
+            )
+            con.commit()
+        self._update_calculated_weight()
+
+    def _update_calculated_weight(self, *_args):
+        if self.k_input.disabled:
+            self.predicted_weight_input.text = ""
+            return
+        calculated = self._calculated_weight_text(
+            self.l_input.text,
+            self.w_input.text,
+            self.t_input.text,
+            self.k_input.text,
+        )
+        self.predicted_weight_input.text = calculated
+
     def _advance_or_save(self, index, fields):
         fields[index].focus = False
-        if self.collection_mode == self.MODE_LWT and fields[index] is self.t_input:
-            self.save_record()
+        for next_index in range(index + 1, len(fields)):
+            if not fields[next_index].disabled:
+                self._focused_data_index = next_index
+                fields[next_index].focus = True
+                return
+        self.save_record()
+
+    def _apply_collection_mode_state(self, clear_irrelevant=False):
+        dimensions_enabled = self.collection_mode in (self.MODE_LWT, self.MODE_FULL)
+        weight_enabled = self.collection_mode in (self.MODE_WEIGHT, self.MODE_FULL)
+        brix_enabled = self.collection_mode in (self.MODE_BRIX, self.MODE_FULL)
+
+        self.k_input.disabled = not dimensions_enabled
+        for field in (self.l_input, self.w_input, self.t_input):
+            field.disabled = not dimensions_enabled
+        self.predicted_weight_input.disabled = not dimensions_enabled
+        self.weight_input.disabled = not weight_enabled
+        self.brix_input.disabled = not brix_enabled
+
+        if not clear_irrelevant:
             return
-        if index < len(fields) - 1:
-            fields[index + 1].focus = True
-        else:
-            self.save_record()
+        if not dimensions_enabled:
+            self.l_input.text = ""
+            self.w_input.text = ""
+            self.t_input.text = ""
+            self.predicted_weight_input.text = ""
+        if not weight_enabled:
+            self.weight_input.text = ""
+        if not brix_enabled:
+            self.brix_input.text = ""
+
+    def _focus_first_measurement_field(self):
+        for field in (self.l_input, self.weight_input, self.brix_input):
+            if not field.disabled:
+                field.focus = True
+                if hasattr(self, "data_fields"):
+                    self._focused_data_index = self.data_fields.index(field)
+                return
 
     def _switch_collection_mode(self, _spinner, mode):
-        if mode not in (self.MODE_LWT, self.MODE_FULL):
+        if mode not in self.COLLECTION_MODES:
             return
         self.collection_mode = mode
         with sqlite3.connect(self.db_path) as con:
@@ -566,13 +669,8 @@ class MangoRecorder(BoxLayout):
             )
             con.commit()
         if hasattr(self, "weight_input"):
-            lwt_only = mode == self.MODE_LWT
-            self.weight_input.disabled = lwt_only
-            self.brix_input.disabled = lwt_only
-            if lwt_only:
-                self.weight_input.text = ""
-                self.brix_input.text = ""
-                self.l_input.focus = True
+            self._apply_collection_mode_state(clear_irrelevant=True)
+            self._focus_first_measurement_field()
         self._set_status(f"Mode: {mode}")
 
     def _status_markup(self):
@@ -870,11 +968,13 @@ class MangoRecorder(BoxLayout):
         self.brix_input.text = brix or ""
         self.sampling_role_spinner.text = sampling_role or ""
         self.comment_input.text = comment or ""
+        self._apply_collection_mode_state(clear_irrelevant=True)
+        self._update_calculated_weight()
         self.template_status.text = (
             f"Template row {row_number}/{total} | Saved {completed}/{total} | "
             f"Block {block} / Tree {tree_id} / Panicle {panicle_id}"
         )
-        self.l_input.focus = True
+        self._focus_first_measurement_field()
 
     def load_example_template(self):
         template_path = Path(__file__).resolve().parent / self.EXAMPLE_TEMPLATE_FILENAME
@@ -1131,12 +1231,16 @@ class MangoRecorder(BoxLayout):
                 + "."
             )
 
+        def enabled_text(field):
+            return "" if field.disabled else field.text.strip()
+
         raw_numbers = {
-            "L": self.l_input.text.strip(),
-            "W": self.w_input.text.strip(),
-            "T": self.t_input.text.strip(),
-            "Weight": self.weight_input.text.strip(),
-            "Brix": self.brix_input.text.strip(),
+            "k": enabled_text(self.k_input),
+            "L": enabled_text(self.l_input),
+            "W": enabled_text(self.w_input),
+            "T": enabled_text(self.t_input),
+            "Weight": enabled_text(self.weight_input),
+            "Brix": enabled_text(self.brix_input),
         }
         def optional_number(name):
             raw_value = raw_numbers[name]
@@ -1152,10 +1256,12 @@ class MangoRecorder(BoxLayout):
                 raise ValueError(f"{name} must be a finite number.")
             return value
 
+        k_val = optional_number("k")
         l_val = optional_number("L")
         w_val = optional_number("W")
         t_val = optional_number("T")
         weight_val = optional_number("Weight")
+        predicted_weight_val = ""
         brix_val = optional_number("Brix")
 
         for name, value in (("L", l_val), ("W", w_val), ("T", t_val)):
@@ -1163,6 +1269,17 @@ class MangoRecorder(BoxLayout):
                 raise ValueError(
                     f"{name} must be greater than 0 and no more than 300 mm."
                 )
+        if k_val != "" and k_val <= 0:
+            raise ValueError("k must be greater than 0.")
+        if k_val != "" and all(value != "" for value in (l_val, w_val, t_val)):
+            calculated_weight = l_val * w_val * t_val * k_val / 1000
+            if not math.isfinite(calculated_weight):
+                raise ValueError("Predicted_Weight must be a finite number.")
+            calculated_text = format(calculated_weight, ".10g")
+            predicted_weight_val = float(calculated_text)
+            self.predicted_weight_input.text = calculated_text
+        else:
+            self.predicted_weight_input.text = ""
         if all(value != "" for value in (l_val, w_val, t_val)):
             if cultivar == "Calypso":
                 t_over_l = t_val / l_val
@@ -1197,6 +1314,7 @@ class MangoRecorder(BoxLayout):
             w_val,
             t_val,
             weight_val,
+            predicted_weight_val,
             brix_val,
             sampling_role,
             comment,
@@ -1217,9 +1335,9 @@ class MangoRecorder(BoxLayout):
                 """
                 INSERT INTO measurements
                 (worksheet_id, block, tree_id, panicle_id, cultivar, l, w, t,
-                 weight, brix, sampling_role, comment, recorded_at,
+                 weight, predicted_weight, brix, sampling_role, comment, recorded_at,
                  template_row_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     self.active_worksheet_id,
@@ -1245,7 +1363,7 @@ class MangoRecorder(BoxLayout):
         self._refresh_count()
         self._set_status(f"Saved {self._record_description(*values[:3])}")
         self._success_feedback()
-        self.l_input.focus = True
+        self._focus_first_measurement_field()
         return True
 
     def _success_feedback(self):
@@ -1278,9 +1396,10 @@ class MangoRecorder(BoxLayout):
         self.w_input.text = ""
         self.t_input.text = ""
         self.weight_input.text = ""
+        self.predicted_weight_input.text = ""
         self.brix_input.text = ""
         self.comment_input.text = ""
-        self.l_input.focus = True
+        self._focus_first_measurement_field()
 
     def clear_all_fields(self):
         for field in (
@@ -1291,6 +1410,7 @@ class MangoRecorder(BoxLayout):
             self.w_input,
             self.t_input,
             self.weight_input,
+            self.predicted_weight_input,
             self.brix_input,
             self.comment_input,
             self.voice_command_input,
@@ -1374,17 +1494,22 @@ class MangoRecorder(BoxLayout):
 
     def move_to_next_field(self):
         index = min(self._focused_data_index, len(self.data_fields) - 1)
-        if index >= len(self.data_fields) - 1:
-            self._set_status('Brix is the last field; say "next fruit" to save')
-            return False
-
         self.data_fields[index].focus = False
-        self._focused_data_index = index + 1
-        self.data_fields[self._focused_data_index].focus = True
+        for next_index in range(index + 1, len(self.data_fields)):
+            if self.data_fields[next_index].disabled:
+                continue
+            self._focused_data_index = next_index
+            self.data_fields[next_index].focus = True
+            self._set_status(
+                f"Voice moved to {self.data_field_names[next_index]}"
+            )
+            return True
+
+        field_name = self.data_field_names[index]
         self._set_status(
-            f"Voice moved to {self.data_field_names[self._focused_data_index]}"
+            f'{field_name} is the last field; say "next fruit" to save'
         )
-        return True
+        return False
 
     @staticmethod
     def _spoken_number(text):
@@ -1473,6 +1598,9 @@ class MangoRecorder(BoxLayout):
 
     def _enter_spoken_value(self, phrase):
         index = min(self._focused_data_index, len(self.data_fields) - 1)
+        if self.data_fields[index].disabled:
+            self._focus_first_measurement_field()
+            index = self._focused_data_index
         if index < 3:
             value = phrase.strip()
         else:
@@ -1951,6 +2079,7 @@ class MangoRecorder(BoxLayout):
                 "W",
                 "T",
                 "Weight",
+                "Predicted_Weight",
                 "Brix",
                 "SamplingRole",
                 "Comment",
@@ -1963,7 +2092,8 @@ class MangoRecorder(BoxLayout):
                 con.execute(
                     """
                     SELECT block, tree_id, panicle_id, cultivar, l, w, t,
-                           weight, brix, sampling_role, comment, recorded_at
+                           weight, predicted_weight, brix, sampling_role,
+                           comment, recorded_at
                     FROM measurements
                     WHERE worksheet_id = ?
                     ORDER BY id

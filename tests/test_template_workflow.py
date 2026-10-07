@@ -55,6 +55,7 @@ class _Field:
         self.text = text
         self.focus = False
         self.readonly = False
+        self.disabled = False
 
 
 class TemplateWorkflowTests(unittest.TestCase):
@@ -64,6 +65,7 @@ class TemplateWorkflowTests(unittest.TestCase):
         self.recorder = MangoRecorder.__new__(MangoRecorder)
         self.recorder.db_path = Path(self.temp_dir.name) / "test.sqlite3"
         self.recorder._active_template_row_id = None
+        self.recorder.collection_mode = self.recorder.MODE_LWT
         self.recorder._init_database()
         self.recorder._load_active_worksheet()
         self.recorder._refresh_worksheet_selector = lambda: None
@@ -85,7 +87,9 @@ class TemplateWorkflowTests(unittest.TestCase):
             "l_input",
             "w_input",
             "t_input",
+            "k_input",
             "weight_input",
+            "predicted_weight_input",
             "brix_input",
             "comment_input",
             "voice_command_input",
@@ -109,6 +113,31 @@ class TemplateWorkflowTests(unittest.TestCase):
 
         self.assertIn("worksheet_template_rows", tables)
         self.assertIn("template_row_id", measurement_columns)
+        self.assertIn("predicted_weight", measurement_columns)
+
+    def test_legacy_predicated_weight_is_renamed_and_rescaled(self):
+        with sqlite3.connect(self.recorder.db_path) as con:
+            con.execute(
+                "ALTER TABLE measurements ADD COLUMN predicated_weight REAL"
+            )
+            con.execute(
+                """
+                INSERT INTO measurements
+                    (worksheet_id, predicated_weight, recorded_at)
+                VALUES (?, ?, ?)
+                """,
+                (self.recorder.active_worksheet_id, 336000, "2026-10-08T00:00:00"),
+            )
+            con.commit()
+
+        self.recorder._init_database()
+        self.recorder._init_database()
+
+        with sqlite3.connect(self.recorder.db_path) as con:
+            migrated = con.execute(
+                "SELECT predicted_weight FROM measurements"
+            ).fetchone()[0]
+        self.assertEqual(migrated, 336.0)
 
     def test_identifiers_are_required_but_other_values_are_optional(self):
         self._add_form_fields()
@@ -119,11 +148,157 @@ class TemplateWorkflowTests(unittest.TestCase):
         values = self.recorder._values()
 
         self.assertEqual(values[:3], ("21", "1", "1"))
-        self.assertEqual(values[3:], ("",) * 8)
+        self.assertEqual(values[3:], ("",) * 9)
 
         self.recorder.tree_input.text = ""
         with self.assertRaisesRegex(ValueError, "TreeID"):
             self.recorder._values()
+
+    def test_predicted_weight_is_calculated_from_dimensions_and_custom_k(self):
+        self._add_form_fields()
+        self.recorder.block_input.text = "21"
+        self.recorder.tree_input.text = "1"
+        self.recorder.panicle_input.text = "1"
+        self.recorder.l_input.text = "100"
+        self.recorder.w_input.text = "80"
+        self.recorder.t_input.text = "70"
+        self.recorder.k_input.text = "0.6"
+
+        values = self.recorder._values()
+
+        self.assertEqual(values[7], "")
+        self.assertEqual(values[8], 336.0)
+        self.assertEqual(self.recorder.weight_input.text, "")
+        self.assertEqual(self.recorder.predicted_weight_input.text, "336")
+
+    def test_calculated_weight_text_requires_four_positive_numbers(self):
+        self.assertEqual(
+            MangoRecorder._calculated_weight_text("100", "80", "70", "0.6"),
+            "336",
+        )
+        self.assertEqual(
+            MangoRecorder._calculated_weight_text("100", "", "70", "0.6"),
+            "",
+        )
+        self.assertEqual(
+            MangoRecorder._calculated_weight_text("100", "80", "70", "-1"),
+            "",
+        )
+
+    def test_invalid_custom_k_is_rejected(self):
+        self._add_form_fields()
+        self.recorder.block_input.text = "21"
+        self.recorder.tree_input.text = "1"
+        self.recorder.panicle_input.text = "1"
+        self.recorder.k_input.text = "0"
+
+        with self.assertRaisesRegex(ValueError, "k must be greater than 0"):
+            self.recorder._values()
+
+    def test_weight_only_mode_enables_only_weight_measurement(self):
+        self._add_form_fields()
+        self.recorder.collection_mode = self.recorder.MODE_WEIGHT
+
+        self.recorder._apply_collection_mode_state()
+
+        self.assertTrue(self.recorder.k_input.disabled)
+        self.assertTrue(self.recorder.l_input.disabled)
+        self.assertTrue(self.recorder.w_input.disabled)
+        self.assertTrue(self.recorder.t_input.disabled)
+        self.assertFalse(self.recorder.weight_input.disabled)
+        self.assertTrue(self.recorder.predicted_weight_input.disabled)
+        self.assertTrue(self.recorder.brix_input.disabled)
+
+    def test_brix_only_mode_enables_only_brix_measurement(self):
+        self._add_form_fields()
+        self.recorder.collection_mode = self.recorder.MODE_BRIX
+
+        self.recorder._apply_collection_mode_state()
+
+        self.assertTrue(self.recorder.k_input.disabled)
+        self.assertTrue(self.recorder.l_input.disabled)
+        self.assertTrue(self.recorder.w_input.disabled)
+        self.assertTrue(self.recorder.t_input.disabled)
+        self.assertTrue(self.recorder.weight_input.disabled)
+        self.assertTrue(self.recorder.predicted_weight_input.disabled)
+        self.assertFalse(self.recorder.brix_input.disabled)
+
+    def test_only_modes_ignore_values_from_disabled_measurements(self):
+        self._add_form_fields()
+        self.recorder.collection_mode = self.recorder.MODE_BRIX
+        self.recorder.block_input.text = "21"
+        self.recorder.tree_input.text = "1"
+        self.recorder.panicle_input.text = "1"
+        self.recorder.k_input.text = "-1"
+        self.recorder.l_input.text = "100"
+        self.recorder.w_input.text = "80"
+        self.recorder.t_input.text = "70"
+        self.recorder.weight_input.text = "350"
+        self.recorder.brix_input.text = "14.5"
+        self.recorder._apply_collection_mode_state()
+
+        values = self.recorder._values()
+
+        self.assertEqual(values[4:9], ("", "", "", "", ""))
+        self.assertEqual(values[9], 14.5)
+
+    def test_return_skips_disabled_fields_and_saves_after_only_field(self):
+        self._add_form_fields()
+        self.recorder.collection_mode = self.recorder.MODE_WEIGHT
+        self.recorder._apply_collection_mode_state()
+        fields = [
+            self.recorder.block_input,
+            self.recorder.tree_input,
+            self.recorder.panicle_input,
+            self.recorder.k_input,
+            self.recorder.l_input,
+            self.recorder.w_input,
+            self.recorder.t_input,
+            self.recorder.weight_input,
+            self.recorder.brix_input,
+        ]
+        saved = []
+        self.recorder.save_record = lambda: saved.append(True)
+
+        self.recorder._advance_or_save(2, fields)
+        self.assertTrue(self.recorder.weight_input.focus)
+        self.assertEqual(self.recorder._focused_data_index, 7)
+
+        self.recorder._advance_or_save(7, fields)
+        self.assertEqual(saved, [True])
+
+    def test_voice_entry_retargets_from_a_disabled_field(self):
+        self._add_form_fields()
+        self.recorder.collection_mode = self.recorder.MODE_BRIX
+        self.recorder.data_fields = [
+            self.recorder.block_input,
+            self.recorder.tree_input,
+            self.recorder.panicle_input,
+            self.recorder.k_input,
+            self.recorder.l_input,
+            self.recorder.w_input,
+            self.recorder.t_input,
+            self.recorder.weight_input,
+            self.recorder.brix_input,
+        ]
+        self.recorder.data_field_names = [
+            "Block",
+            "TreeID",
+            "PanicleID",
+            "k",
+            "L",
+            "W",
+            "T",
+            "Weight",
+            "Brix",
+        ]
+        self.recorder._focused_data_index = 3
+        self.recorder._apply_collection_mode_state()
+
+        self.assertTrue(self.recorder._enter_spoken_value("14.5"))
+
+        self.assertEqual(self.recorder._focused_data_index, 8)
+        self.assertEqual(self.recorder.brix_input.text, "14.5")
 
     def test_template_save_advances_to_next_unfinished_row(self):
         self.recorder._load_template_target = lambda: None

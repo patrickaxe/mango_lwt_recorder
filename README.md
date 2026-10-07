@@ -13,26 +13,37 @@ The on-screen fields are:
 - L (mm)
 - W (mm)
 - T (mm)
+- k (custom weight factor)
 - Weight (g)
+- Predicted_Weight (g, calculated)
 - Brix (°)
 - SamplingRole (`Core`, `Reserve`, `Destructive`, `Observation`, `Drop`, or
   `Replaced`; optional)
 - Comment (optional)
 
-Two collection modes are available:
+Four collection modes are available:
 
 - **LWT only**: pressing Return/Data after T validates and saves the record,
   increments a numeric PanicleID, vibrates briefly on Android, and returns focus
   to L for the next fruit.
+- **Weight only**: enables the measured Weight field and saves after Weight.
+- **Brix only**: enables the Brix field and saves after Brix.
 - **LWT + Weight + Brix**: retains the complete field sequence and saves after
   Brix.
 
-The selected mode is remembered between sessions. Block, TreeID, and PanicleID
-must be present on every saved record. All other fields are optional, including
-L/W/T in LWT-only mode. Populated dimension values must be in the existing valid
-range. When all three dimensions are present, `Calypso` shape validation checks
+The selected mode is remembered between sessions. Fields that do not belong to
+the selected mode are disabled and skipped by keyboard and voice navigation.
+Block, TreeID, and PanicleID must be present on every saved record. All other
+enabled fields are optional. Populated dimension values must be in the existing
+valid range. When all three dimensions are present, `Calypso` shape validation checks
 `0.5 <= T/L <= 1.0` and `0.5 <= T/W <= 1.1`; `Other` uses the existing
 `L >= W >= T` orientation check.
+
+The custom `k` value is remembered between sessions and retained when moving to
+the next fruit. When `k`, L, W, and T are all positive numbers, the app fills and
+saves `Predicted_Weight` automatically using
+`Predicted_Weight = k * L * W * T / 1000`. The original Weight field remains available
+for manual measured-weight entry.
 
 SamplingRole defaults to `Core` and is retained after SAVE & NEXT to make repeated
 cohort measurements fast. Comment is optional and is cleared after each saved
@@ -41,7 +52,7 @@ record.
 Exported CSV columns:
 
 ```text
-Block,TreeID,PanicleID,Cultivar,L,W,T,Weight,Brix,SamplingRole,Comment,Timestamp
+Block,TreeID,PanicleID,Cultivar,L,W,T,Weight,Predicted_Weight,Brix,SamplingRole,Comment,Timestamp
 ```
 
 Data is saved immediately to a local SQLite database. Only populated numeric
