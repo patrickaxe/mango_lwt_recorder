@@ -97,9 +97,13 @@ class MangoRecorder(BoxLayout):
         self._focused_data_index = 0
         self._updating_worksheet_spinner = False
         self._active_template_row_id = None
+        self._blank_entry_active = False
         self._android_template_picker_bound = False
         self.collection_mode = self.MODE_LWT
         self.weight_factor = ""
+        self.predicted_weight_mean = None
+        self.weight_mean = None
+        self.brix_mean = None
         self._init_database()
         self._load_active_worksheet()
         self._load_collection_mode()
@@ -313,6 +317,21 @@ class MangoRecorder(BoxLayout):
         )
         return field
 
+    def _set_identifier_fields_editable(self, editable):
+        for field in (
+            self.block_input,
+            self.tree_input,
+            self.panicle_input,
+        ):
+            field.focus = False
+            field.disabled = False
+            field.readonly = not editable
+            if editable:
+                # On mobile, making a TextInput readonly also makes it
+                # non-focusable. Kivy does not restore that flag when readonly
+                # is later cleared, so restore it explicitly for manual rows.
+                field.is_focusable = True
+
     def _build_ui(self):
         title = Label(
             text="[b]Mango LWT Recorder[/b]",
@@ -366,23 +385,28 @@ class MangoRecorder(BoxLayout):
                 text="[b]Template[/b]",
                 markup=True,
                 font_size="17sp",
-                size_hint_x=0.25,
+                size_hint_x=0.2,
             )
         )
         example_template_btn = Button(
-            text="USE EXAMPLE", font_size="15sp", size_hint_x=0.375
+            text="USE EXAMPLE", font_size="13sp", size_hint_x=0.267
         )
         example_template_btn.bind(
             on_release=lambda *_: self.load_example_template()
         )
         import_template_btn = Button(
-            text="IMPORT CSV", font_size="15sp", size_hint_x=0.375
+            text="IMPORT CSV", font_size="13sp", size_hint_x=0.267
         )
         import_template_btn.bind(
             on_release=lambda *_: self.choose_template_csv()
         )
+        add_row_btn = Button(
+            text="ADD ROW", font_size="13sp", size_hint_x=0.266
+        )
+        add_row_btn.bind(on_release=lambda *_: self.request_add_row())
         template_bar.add_widget(example_template_btn)
         template_bar.add_widget(import_template_btn)
+        template_bar.add_widget(add_row_btn)
         self.add_widget(template_bar)
 
         self.template_status = Label(
@@ -507,6 +531,24 @@ class MangoRecorder(BoxLayout):
         scroll.add_widget(form)
         self.add_widget(scroll)
 
+        self.prediction_summary = Label(
+            text=self._prediction_summary_markup(),
+            markup=True,
+            size_hint_y=None,
+            height=dp(116 if self.collection_mode == self.MODE_FULL else 66),
+            font_size="17sp",
+            halign="center",
+            valign="middle",
+        )
+        self.prediction_summary.bind(
+            size=lambda inst, value: setattr(inst, "text_size", value)
+        )
+        self.tree_input.bind(text=self._refresh_prediction_display)
+        self.panicle_input.bind(text=self._refresh_prediction_display)
+        self.weight_input.bind(text=self._refresh_prediction_display)
+        self.brix_input.bind(text=self._refresh_prediction_display)
+        self.add_widget(self.prediction_summary)
+
         # Return/Next on the software keyboard advances through fields.
         focus_order = [
             self.block_input,
@@ -608,6 +650,7 @@ class MangoRecorder(BoxLayout):
     def _update_calculated_weight(self, *_args):
         if self.k_input.disabled:
             self.predicted_weight_input.text = ""
+            self._refresh_prediction_display()
             return
         calculated = self._calculated_weight_text(
             self.l_input.text,
@@ -616,6 +659,68 @@ class MangoRecorder(BoxLayout):
             self.k_input.text,
         )
         self.predicted_weight_input.text = calculated
+        self._refresh_prediction_display()
+
+    def _prediction_summary_markup(self):
+        tree_id = escape_markup(self.tree_input.text.strip() or "—")
+        panicle_id = escape_markup(self.panicle_input.text.strip() or "—")
+        header = (
+            f"[b]TreeID:[/b] {tree_id}   |   "
+            f"[b]PanicleID:[/b] {panicle_id}"
+        )
+
+        def measurement_line(label, field, mean_value, unit):
+            current = escape_markup(field.text.strip() or "—")
+            mean = "—" if mean_value is None else format(mean_value, ".2f")
+            return (
+                f"[b]{label}:[/b] {current} {unit}   |   "
+                f"[b]Mean:[/b] {mean} {unit}"
+            )
+
+        if self.collection_mode == self.MODE_WEIGHT:
+            lines = [
+                measurement_line(
+                    "Weight", self.weight_input, self.weight_mean, "g"
+                )
+            ]
+        elif self.collection_mode == self.MODE_BRIX:
+            lines = [
+                measurement_line(
+                    "Brix", self.brix_input, self.brix_mean, "°"
+                )
+            ]
+        elif self.collection_mode == self.MODE_FULL:
+            lines = [
+                measurement_line(
+                    "Predicted Weight",
+                    self.predicted_weight_input,
+                    self.predicted_weight_mean,
+                    "g",
+                ),
+                measurement_line(
+                    "Weight", self.weight_input, self.weight_mean, "g"
+                ),
+                measurement_line(
+                    "Brix", self.brix_input, self.brix_mean, "°"
+                ),
+            ]
+        else:
+            lines = [
+                measurement_line(
+                    "Predicted Weight",
+                    self.predicted_weight_input,
+                    self.predicted_weight_mean,
+                    "g",
+                )
+            ]
+        return "\n".join((header, *lines))
+
+    def _refresh_prediction_display(self, *_args):
+        if hasattr(self, "prediction_summary"):
+            self.prediction_summary.height = dp(
+                116 if self.collection_mode == self.MODE_FULL else 66
+            )
+            self.prediction_summary.text = self._prediction_summary_markup()
 
     def _advance_or_save(self, index, fields):
         fields[index].focus = False
@@ -671,6 +776,7 @@ class MangoRecorder(BoxLayout):
         if hasattr(self, "weight_input"):
             self._apply_collection_mode_state(clear_irrelevant=True)
             self._focus_first_measurement_field()
+            self._refresh_prediction_display()
         self._set_status(f"Mode: {mode}")
 
     def _status_markup(self):
@@ -688,12 +794,25 @@ class MangoRecorder(BoxLayout):
 
     def _refresh_count(self):
         with sqlite3.connect(self.db_path) as con:
-            self.record_count = con.execute(
-                "SELECT COUNT(*) FROM measurements WHERE worksheet_id = ?",
+            (
+                self.record_count,
+                self.predicted_weight_mean,
+                self.weight_mean,
+                self.brix_mean,
+            ) = con.execute(
+                """
+                SELECT COUNT(*),
+                       AVG(NULLIF(predicted_weight, '')),
+                       AVG(NULLIF(weight, '')),
+                       AVG(NULLIF(brix, ''))
+                FROM measurements
+                WHERE worksheet_id = ?
+                """,
                 (self.active_worksheet_id,),
-            ).fetchone()[0]
+            ).fetchone()
         if hasattr(self, "status"):
             self.status.text = self._status_markup()
+        self._refresh_prediction_display()
 
     def _worksheet_rows(self):
         with sqlite3.connect(self.db_path) as con:
@@ -877,7 +996,76 @@ class MangoRecorder(BoxLayout):
         self._load_template_target()
         self._set_status(f"Imported template: {worksheet_name} ({row_count} rows)")
 
+    def request_add_row(self):
+        form_has_data = any(
+            field.text.strip()
+            for field in (
+                self.block_input,
+                self.tree_input,
+                self.panicle_input,
+                self.l_input,
+                self.w_input,
+                self.t_input,
+                self.weight_input,
+                self.brix_input,
+                self.comment_input,
+            )
+        )
+        if not form_has_data:
+            self.start_blank_entry()
+            return
+
+        template_note = (
+            "\n\nThe current template row will remain pending."
+            if self._active_template_row_id is not None
+            else ""
+        )
+        self._show_confirmation(
+            "Add row",
+            "Discard the unsaved values currently shown and open a new row?"
+            f"{template_note}",
+            "ADD ROW",
+            self.start_blank_entry,
+        )
+
+    def start_blank_entry(self):
+        with sqlite3.connect(self.db_path) as con:
+            total, completed = con.execute(
+                """
+                SELECT COUNT(*), COUNT(measurement.id)
+                FROM worksheet_template_rows AS template
+                LEFT JOIN measurements AS measurement
+                  ON measurement.template_row_id = template.id
+                WHERE template.worksheet_id = ?
+                """,
+                (self.active_worksheet_id,),
+            ).fetchone()
+
+        self._blank_entry_active = total > 0
+        self._active_template_row_id = None
+        self._set_identifier_fields_editable(True)
+        self.clear_all_fields(focus_block=False)
+        self.cultivar_spinner.text = "Calypso"
+        self.sampling_role_spinner.text = "Core"
+        self._apply_collection_mode_state(clear_irrelevant=True)
+        if total:
+            self.template_status.text = (
+                f"Extra row in imported worksheet | Template saved "
+                f"{completed}/{total}. Save to resume the template."
+            )
+        else:
+            self.template_status.text = (
+                "New row: Block, TreeID, and PanicleID are required."
+            )
+        self._set_status("New row ready")
+        # Let the confirmation Popup finish dismissing before requesting the
+        # Android software keyboard for the now-editable Block field.
+        Clock.schedule_once(
+            lambda _dt: setattr(self.block_input, "focus", True), 0.2
+        )
+
     def _load_template_target(self):
+        self._blank_entry_active = False
         with sqlite3.connect(self.db_path) as con:
             total = con.execute(
                 """
@@ -913,20 +1101,16 @@ class MangoRecorder(BoxLayout):
                 (self.active_worksheet_id,),
             ).fetchone()
 
-        self.clear_all_fields()
+        self.clear_all_fields(focus_block=False)
         self._active_template_row_id = None
-        for identifier_field in (
-            self.block_input,
-            self.tree_input,
-            self.panicle_input,
-        ):
-            identifier_field.readonly = False
+        self._set_identifier_fields_editable(True)
         if total == 0:
             self.cultivar_spinner.text = "Calypso"
             self.sampling_role_spinner.text = "Core"
             self.template_status.text = (
                 "Manual worksheet: Block, TreeID, and PanicleID are required."
             )
+            self.block_input.focus = True
             return
         if row is None:
             self.cultivar_spinner.text = ""
@@ -954,12 +1138,7 @@ class MangoRecorder(BoxLayout):
         self.block_input.text = block
         self.tree_input.text = tree_id
         self.panicle_input.text = panicle_id
-        for identifier_field in (
-            self.block_input,
-            self.tree_input,
-            self.panicle_input,
-        ):
-            identifier_field.readonly = True
+        self._set_identifier_fields_editable(False)
         self.cultivar_spinner.text = cultivar or ""
         self.l_input.text = l_value or ""
         self.w_input.text = w_value or ""
@@ -1330,6 +1509,7 @@ class MangoRecorder(BoxLayout):
             return False
 
         template_row_id = self._active_template_row_id
+        blank_entry_active = self._blank_entry_active
         with sqlite3.connect(self.db_path) as con:
             con.execute(
                 """
@@ -1349,6 +1529,9 @@ class MangoRecorder(BoxLayout):
             con.commit()
 
         if template_row_id is not None:
+            self._load_template_target()
+        elif blank_entry_active:
+            self._blank_entry_active = False
             self._load_template_target()
         else:
             old_panicle = self.panicle_input.text.strip()
@@ -1399,9 +1582,10 @@ class MangoRecorder(BoxLayout):
         self.predicted_weight_input.text = ""
         self.brix_input.text = ""
         self.comment_input.text = ""
+        self._refresh_prediction_display()
         self._focus_first_measurement_field()
 
-    def clear_all_fields(self):
+    def clear_all_fields(self, focus_block=True):
         for field in (
             self.block_input,
             self.tree_input,
@@ -1416,7 +1600,8 @@ class MangoRecorder(BoxLayout):
             self.voice_command_input,
         ):
             field.text = ""
-        self.block_input.focus = True
+        if focus_block:
+            self.block_input.focus = True
 
     @staticmethod
     def _normalize_voice_command(command):

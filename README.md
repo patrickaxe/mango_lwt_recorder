@@ -45,6 +45,14 @@ saves `Predicted_Weight` automatically using
 `Predicted_Weight = k * L * W * T / 1000`. The original Weight field remains available
 for manual measured-weight entry.
 
+The main collection page also shows a persistent summary containing the current
+TreeID and PanicleID. Its measurement and Mean follow the selected mode:
+Predicted Weight for **LWT only**, Weight for **Weight only**, and Brix for
+**Brix only**. **LWT + Weight + Brix** displays all three measurements and their
+separate Means. Each Mean uses only saved, nonblank values from its matching
+field in the active worksheet. The display refreshes after edits, saves,
+undo/delete operations, mode changes, and worksheet changes.
+
 SamplingRole defaults to `Core` and is retained after SAVE & NEXT to make repeated
 cohort measurements fast. Comment is optional and is cleared after each saved
 record.
@@ -78,6 +86,12 @@ the actual save time.
 Template rows are not counted as collected measurements. The app displays and
 prefills the next unfinished template row; **SAVE & NEXT** records it and advances
 to the next row. Undoing a template record makes that row available again.
+
+Use **ADD ROW** in the Template menu to enter a fruit that was missing from an
+imported CSV. The extra fruit is saved in the current worksheet without consuming
+the pending template row, and the app resumes the next unfinished template row
+after the extra row is saved. On a manual worksheet, **ADD ROW** simply clears
+the form for a new record.
 
 `FruitSizingTemp.csv` is bundled with the app as an example. Tap **USE EXAMPLE**
 to create a new worksheet from it. Importing a template is optional; ordinary

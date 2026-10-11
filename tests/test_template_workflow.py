@@ -56,6 +56,7 @@ class _Field:
         self.focus = False
         self.readonly = False
         self.disabled = False
+        self.is_focusable = True
 
 
 class TemplateWorkflowTests(unittest.TestCase):
@@ -65,6 +66,7 @@ class TemplateWorkflowTests(unittest.TestCase):
         self.recorder = MangoRecorder.__new__(MangoRecorder)
         self.recorder.db_path = Path(self.temp_dir.name) / "test.sqlite3"
         self.recorder._active_template_row_id = None
+        self.recorder._blank_entry_active = False
         self.recorder.collection_mode = self.recorder.MODE_LWT
         self.recorder._init_database()
         self.recorder._load_active_worksheet()
@@ -184,6 +186,102 @@ class TemplateWorkflowTests(unittest.TestCase):
             MangoRecorder._calculated_weight_text("100", "80", "70", "-1"),
             "",
         )
+
+    def test_prediction_display_shows_live_value_and_saved_mean(self):
+        self._add_form_fields()
+        self.recorder.prediction_summary = _Field()
+        self.recorder.predicted_weight_mean = None
+        self.recorder.weight_mean = None
+        self.recorder.brix_mean = None
+        self.recorder.tree_input.text = "12"
+        self.recorder.panicle_input.text = "7"
+        self.recorder.k_input.text = "0.6"
+        self.recorder.l_input.text = "100"
+        self.recorder.w_input.text = "80"
+        self.recorder.t_input.text = "70"
+
+        self.recorder._update_calculated_weight()
+
+        self.assertIn("[b]TreeID:[/b] 12", self.recorder.prediction_summary.text)
+        self.assertIn("[b]PanicleID:[/b] 7", self.recorder.prediction_summary.text)
+        self.assertIn(
+            "[b]Predicted Weight:[/b] 336 g",
+            self.recorder.prediction_summary.text,
+        )
+        self.assertIn("[b]Mean:[/b] — g", self.recorder.prediction_summary.text)
+
+        with sqlite3.connect(self.recorder.db_path) as con:
+            con.executemany(
+                """
+                INSERT INTO measurements
+                    (worksheet_id, predicted_weight, weight, brix, recorded_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    (
+                        self.recorder.active_worksheet_id,
+                        300,
+                        330,
+                        0,
+                        "2026-10-12T00:00:00",
+                    ),
+                    (
+                        self.recorder.active_worksheet_id,
+                        500,
+                        370,
+                        16,
+                        "2026-10-12T00:01:00",
+                    ),
+                    (
+                        self.recorder.active_worksheet_id,
+                        "",
+                        "",
+                        "",
+                        "2026-10-12T00:02:00",
+                    ),
+                ),
+            )
+            con.commit()
+
+        MangoRecorder._refresh_count(self.recorder)
+
+        self.assertEqual(self.recorder.record_count, 3)
+        self.assertEqual(self.recorder.predicted_weight_mean, 400)
+        self.assertEqual(self.recorder.weight_mean, 350)
+        self.assertEqual(self.recorder.brix_mean, 8)
+        self.assertIn(
+            "[b]Mean:[/b] 400.00 g", self.recorder.prediction_summary.text
+        )
+
+    def test_prediction_display_selects_means_for_collection_mode(self):
+        self._add_form_fields()
+        self.recorder.prediction_summary = _Field()
+        self.recorder.predicted_weight_mean = 400
+        self.recorder.weight_mean = 350
+        self.recorder.brix_mean = 14
+        self.recorder.predicted_weight_input.text = "410"
+        self.recorder.weight_input.text = "360"
+        self.recorder.brix_input.text = "15"
+
+        self.recorder.collection_mode = self.recorder.MODE_WEIGHT
+        self.recorder._refresh_prediction_display()
+        self.assertIn("[b]Weight:[/b] 360 g", self.recorder.prediction_summary.text)
+        self.assertIn("[b]Mean:[/b] 350.00 g", self.recorder.prediction_summary.text)
+        self.assertNotIn("Predicted Weight", self.recorder.prediction_summary.text)
+        self.assertNotIn("[b]Brix:", self.recorder.prediction_summary.text)
+
+        self.recorder.collection_mode = self.recorder.MODE_BRIX
+        self.recorder._refresh_prediction_display()
+        self.assertIn("[b]Brix:[/b] 15 °", self.recorder.prediction_summary.text)
+        self.assertIn("[b]Mean:[/b] 14.00 °", self.recorder.prediction_summary.text)
+        self.assertNotIn("Predicted Weight", self.recorder.prediction_summary.text)
+        self.assertNotIn("[b]Weight:", self.recorder.prediction_summary.text)
+
+        self.recorder.collection_mode = self.recorder.MODE_FULL
+        self.recorder._refresh_prediction_display()
+        self.assertIn("Predicted Weight", self.recorder.prediction_summary.text)
+        self.assertIn("[b]Weight:", self.recorder.prediction_summary.text)
+        self.assertIn("[b]Brix:", self.recorder.prediction_summary.text)
 
     def test_invalid_custom_k_is_rejected(self):
         self._add_form_fields()
@@ -334,6 +432,95 @@ class TemplateWorkflowTests(unittest.TestCase):
         with sqlite3.connect(self.recorder.db_path) as con:
             remaining = con.execute("SELECT COUNT(*) FROM measurements").fetchone()[0]
         self.assertEqual(remaining, 0)
+
+    def test_extra_row_in_imported_worksheet_resumes_template(self):
+        self.recorder._load_template_target = lambda: None
+        self.recorder.import_template_text(
+            "Block,TreeID,PanicleID\n21,1,1\n21,1,2\n",
+            "Field plan",
+        )
+        self._add_form_fields()
+        self.recorder._load_template_target = types.MethodType(
+            MangoRecorder._load_template_target, self.recorder
+        )
+        self.recorder._load_template_target()
+        first_template_row_id = self.recorder._active_template_row_id
+
+        for identifier_field in (
+            self.recorder.block_input,
+            self.recorder.tree_input,
+            self.recorder.panicle_input,
+        ):
+            identifier_field.disabled = True
+            identifier_field.is_focusable = False
+        scheduled_focus = []
+        with mock.patch.object(
+            app_module.Clock,
+            "schedule_once",
+            side_effect=lambda callback, *_args: scheduled_focus.append(callback),
+        ):
+            self.recorder.start_blank_entry()
+
+        self.assertTrue(self.recorder._blank_entry_active)
+        self.assertIsNone(self.recorder._active_template_row_id)
+        for identifier_field in (
+            self.recorder.block_input,
+            self.recorder.tree_input,
+            self.recorder.panicle_input,
+        ):
+            self.assertFalse(identifier_field.readonly)
+            self.assertFalse(identifier_field.disabled)
+            self.assertTrue(identifier_field.is_focusable)
+        self.assertFalse(self.recorder.block_input.focus)
+        self.assertEqual(len(scheduled_focus), 1)
+        scheduled_focus[0](0.2)
+        self.assertTrue(self.recorder.block_input.focus)
+        self.assertEqual(self.recorder.block_input.text, "")
+        self.assertIn("Save to resume", self.recorder.template_status.text)
+
+        self.recorder.block_input.text = "21"
+        self.assertFalse(self.recorder.save_record())
+        self.assertTrue(self.recorder._blank_entry_active)
+        self.assertIsNone(self.recorder._active_template_row_id)
+
+        self.recorder.tree_input.text = "9"
+        self.recorder.panicle_input.text = "99"
+        self.assertTrue(self.recorder.save_record())
+
+        self.assertFalse(self.recorder._blank_entry_active)
+        self.assertEqual(self.recorder._active_template_row_id, first_template_row_id)
+        self.assertEqual(self.recorder.tree_input.text, "1")
+        self.assertEqual(self.recorder.panicle_input.text, "1")
+        self.assertTrue(self.recorder.panicle_input.readonly)
+        with sqlite3.connect(self.recorder.db_path) as con:
+            extra_record = con.execute(
+                """
+                SELECT tree_id, panicle_id, template_row_id
+                FROM measurements
+                """
+            ).fetchone()
+        self.assertEqual(extra_record, ("9", "99", None))
+
+    def test_add_row_confirms_before_discarding_unsaved_values(self):
+        self._add_form_fields()
+        self.recorder.block_input.text = "21"
+        confirmations = []
+        self.recorder._show_confirmation = lambda *args: confirmations.append(args)
+
+        self.recorder.request_add_row()
+
+        self.assertEqual(self.recorder.block_input.text, "21")
+        self.assertEqual(len(confirmations), 1)
+        title, message, confirm_text, on_confirm = confirmations[0]
+        self.assertEqual(title, "Add row")
+        self.assertIn("Discard the unsaved values", message)
+        self.assertEqual(confirm_text, "ADD ROW")
+
+        on_confirm()
+        self.assertEqual(self.recorder.block_input.text, "")
+        self.assertEqual(self.recorder.template_status.text, (
+            "New row: Block, TreeID, and PanicleID are required."
+        ))
 
     def test_refresh_error_does_not_report_a_committed_import_as_failed(self):
         messages = []
