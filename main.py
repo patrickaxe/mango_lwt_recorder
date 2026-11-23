@@ -25,6 +25,7 @@ from kivy.uix.scrollview import ScrollView
 from kivy.uix.spinner import Spinner
 from kivy.uix.textinput import TextInput
 
+from gnss import GnssController
 from template_csv import OPTIONAL_TEMPLATE_COLUMNS, parse_template_csv
 
 if platform == "android":
@@ -99,6 +100,13 @@ class MangoRecorder(BoxLayout):
         self._active_template_row_id = None
         self._blank_entry_active = False
         self._android_template_picker_bound = False
+        self.gnss = GnssController(android=platform == "android")
+        self._gnss_foreground = True
+        self._location_permission_pending = False
+        self._location_permission_callback = None
+        self._location_permission_token = 0
+        self._gnss_permission_retry_event = None
+        self._gnss_permission_status = None
         self.collection_mode = self.MODE_LWT
         self.weight_factor = ""
         self.predicted_weight_mean = None
@@ -112,7 +120,10 @@ class MangoRecorder(BoxLayout):
         self._load_template_target()
         self._refresh_count()
         Clock.schedule_once(lambda _dt: setattr(self.block_input, "focus", True), 0.4)
-        Clock.schedule_once(lambda _dt: self._request_storage_permissions(), 0.8)
+        self._gnss_refresh_event = Clock.schedule_interval(
+            self._refresh_gnss_display, 1
+        )
+        Clock.schedule_once(lambda _dt: self._request_device_permissions(), 0.8)
 
     def _init_database(self):
         with sqlite3.connect(self.db_path) as con:
@@ -148,7 +159,10 @@ class MangoRecorder(BoxLayout):
                     weight REAL,
                     predicted_weight REAL,
                     brix REAL,
-                    recorded_at TEXT NOT NULL
+                    recorded_at TEXT NOT NULL,
+                    longitude REAL,
+                    latitude REAL,
+                    gnss_quality INTEGER
                 )
                 """
             )
@@ -197,6 +211,15 @@ class MangoRecorder(BoxLayout):
                 )
             if "brix" not in columns:
                 con.execute("ALTER TABLE measurements ADD COLUMN brix REAL")
+            for column, column_type in (
+                ("longitude", "REAL"),
+                ("latitude", "REAL"),
+                ("gnss_quality", "INTEGER"),
+            ):
+                if column not in columns:
+                    con.execute(
+                        f"ALTER TABLE measurements ADD COLUMN {column} {column_type}"
+                    )
             if "sampling_role" not in columns:
                 con.execute(
                     "ALTER TABLE measurements ADD COLUMN sampling_role TEXT"
@@ -479,6 +502,31 @@ class MangoRecorder(BoxLayout):
             height=dp(54),
         )
         self.comment_input = self._field("Optional comment", multiline=False)
+        self.longitude_input = self._field("Automatic from phone")
+        self.latitude_input = self._field("Automatic from phone")
+        self.gnss_quality_input = self._field("Not reported by receiver")
+        for field in (
+            self.longitude_input, self.latitude_input, self.gnss_quality_input
+        ):
+            field.readonly = True
+            field.is_focusable = False
+            field.font_size = "17sp"
+        self.gnss_status = Label(
+            text="Waiting for GNSS",
+            font_size="14sp",
+            size_hint_y=None,
+            height=dp(54),
+            halign="left",
+            valign="middle",
+        )
+        self.gnss_status.bind(
+            size=lambda inst, value: setattr(inst, "text_size", value)
+        )
+        retry_gnss_btn = Button(
+            text="RETRY GNSS", font_size="17sp", size_hint_y=None, height=dp(54)
+        )
+        retry_gnss_btn.bind(on_release=lambda *_: self.retry_gnss())
+        self._refresh_gnss_display()
         self._apply_collection_mode_state(clear_irrelevant=True)
         self.voice_command_input = self._field("Type/dictate command")
         self.voice_command_input.font_size = "14sp"
@@ -512,6 +560,11 @@ class MangoRecorder(BoxLayout):
             ("Brix (°)", self.brix_input),
             ("SamplingRole", self.sampling_role_spinner),
             ("Comment", self.comment_input),
+            ("Longitude", self.longitude_input),
+            ("Latitude", self.latitude_input),
+            ("GNSS quality", self.gnss_quality_input),
+            ("GNSS status", self.gnss_status),
+            ("GNSS control", retry_gnss_btn),
             ("Voice control", voice_controls),
         ]
         for text, widget in rows:
@@ -1366,25 +1419,156 @@ class MangoRecorder(BoxLayout):
             return Path("/storage/emulated/0/Download")
         return Path.home() / "Downloads"
 
-    def _request_storage_permissions(self):
+    def _request_device_permissions(self):
+        if not self._gnss_foreground:
+            return
+        if self._location_permission_pending:
+            # A platform permission callback can be lost. Recheck the actual
+            # grant before allowing this flag to suppress GNSS indefinitely.
+            self._start_gnss()
+            return
+        if getattr(self, "_voice_permission_pending", False):
+            # Android cancels overlapping permission requests. Some p4a
+            # versions can lose that immediate cancellation callback.
+            self._gnss_permission_status = "Waiting for microphone permission to finish"
+            if self._gnss_permission_retry_event is None:
+                self._gnss_permission_retry_event = Clock.schedule_once(
+                    self._retry_device_permissions, 0.5
+                )
+            self._refresh_gnss_display()
+            return
+        if self._gnss_permission_retry_event is not None:
+            self._gnss_permission_retry_event.cancel()
+            self._gnss_permission_retry_event = None
         if platform != "android":
+            self._start_gnss()
             return
 
         try:
-            from android.permissions import Permission, request_permissions
+            from android.permissions import (
+                Permission, check_permission, request_permissions
+            )
+            from jnius import autoclass
         except ImportError:
+            self._gnss_permission_status = "GNSS unavailable on this device"
             return
 
-        permissions = [
-            permission
-            for permission in (
-                getattr(Permission, "READ_EXTERNAL_STORAGE", None),
-                getattr(Permission, "WRITE_EXTERNAL_STORAGE", None),
+        # Android 12+ requires requesting precise and approximate access together.
+        permissions = []
+        if not check_permission(Permission.ACCESS_FINE_LOCATION):
+            permissions.extend(
+                [Permission.ACCESS_FINE_LOCATION, Permission.ACCESS_COARSE_LOCATION]
             )
-            if permission
-        ]
+        # Android 10+ exports through MediaStore without storage permission.
+        if int(autoclass("android.os.Build$VERSION").SDK_INT) < 29:
+            permissions.extend(
+                permission
+                for permission in (
+                    Permission.READ_EXTERNAL_STORAGE,
+                    Permission.WRITE_EXTERNAL_STORAGE,
+                )
+                if not check_permission(permission)
+            )
         if permissions:
-            request_permissions(permissions)
+            self._location_permission_token += 1
+            request_token = self._location_permission_token
+            self._location_permission_pending = True
+            self._gnss_permission_status = "Waiting for location permission"
+
+            def permission_result(_permissions, _grants):
+                Clock.schedule_once(
+                    lambda _dt: self._after_device_permissions(request_token), 0
+                )
+
+            self._location_permission_callback = permission_result
+            try:
+                request_permissions(permissions, permission_result)
+            except Exception:
+                self._location_permission_pending = False
+                self._location_permission_callback = None
+                self._gnss_permission_status = "Could not request location permission"
+                traceback.print_exc()
+        else:
+            self._start_gnss()
+
+    def _retry_device_permissions(self, _dt=0):
+        self._gnss_permission_retry_event = None
+        self._request_device_permissions()
+
+    def _after_device_permissions(self, request_token=None):
+        if (
+            request_token is not None
+            and request_token != self._location_permission_token
+        ):
+            return
+        self._location_permission_pending = False
+        self._location_permission_callback = None
+        self._gnss_permission_status = None
+        if self._gnss_foreground:
+            self._start_gnss()
+
+    def _start_gnss(self):
+        if not self._gnss_foreground:
+            return
+        if platform == "android":
+            from android.permissions import Permission, check_permission
+
+            precise_granted = check_permission(Permission.ACCESS_FINE_LOCATION)
+            if self._location_permission_pending:
+                if not precise_granted:
+                    return
+                self._location_permission_token += 1
+                self._location_permission_pending = False
+                self._location_permission_callback = None
+            if not precise_granted:
+                self.gnss.stop()
+                self._gnss_permission_status = (
+                    "Allow precise location in app settings to record GNSS"
+                )
+                self._refresh_gnss_display()
+                return
+        self._gnss_permission_status = None
+        self.gnss.start()
+        self._refresh_gnss_display()
+
+    def retry_gnss(self):
+        # The button is available after the permission dialog has gone away,
+        # including when Android never delivered its result callback.
+        self._location_permission_token += 1
+        self._location_permission_pending = False
+        self._location_permission_callback = None
+        self._gnss_permission_status = None
+        self.gnss.stop()
+        self._request_device_permissions()
+        self._refresh_gnss_display()
+
+    def pause_gnss(self):
+        self._gnss_foreground = False
+        self.gnss.stop()
+
+    def resume_gnss(self):
+        self._gnss_foreground = True
+        self._start_gnss()
+
+    def _refresh_gnss_display(self, _dt=0):
+        snapshot = self.gnss.snapshot()
+        self.longitude_input.text = (
+            "" if snapshot.longitude is None else f"{snapshot.longitude:.7f}"
+        )
+        self.latitude_input.text = (
+            "" if snapshot.latitude is None else f"{snapshot.latitude:.7f}"
+        )
+        self.gnss_quality_input.text = (
+            "" if snapshot.gnss_quality is None else str(snapshot.gnss_quality)
+        )
+        self.gnss_status.text = self._gnss_permission_status or snapshot.status
+
+    def _gnss_values(self):
+        controller = getattr(self, "gnss", None)
+        if controller is None:
+            return None, None, None
+        snapshot = controller.snapshot()
+        return snapshot.longitude, snapshot.latitude, snapshot.gnss_quality
 
     def _values(self):
         block = self.block_input.text.strip()
@@ -1510,19 +1694,22 @@ class MangoRecorder(BoxLayout):
 
         template_row_id = self._active_template_row_id
         blank_entry_active = self._blank_entry_active
+        recorded_at = self._timestamp()
+        gnss_values = self._gnss_values()
         with sqlite3.connect(self.db_path) as con:
             con.execute(
                 """
                 INSERT INTO measurements
                 (worksheet_id, block, tree_id, panicle_id, cultivar, l, w, t,
                  weight, predicted_weight, brix, sampling_role, comment, recorded_at,
-                 template_row_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 longitude, latitude, gnss_quality, template_row_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     self.active_worksheet_id,
                     *values,
-                    self._timestamp(),
+                    recorded_at,
+                    *gnss_values,
                     template_row_id,
                 ),
             )
@@ -1544,7 +1731,11 @@ class MangoRecorder(BoxLayout):
                 self.panicle_input.text = old_panicle
 
         self._refresh_count()
-        self._set_status(f"Saved {self._record_description(*values[:3])}")
+        message = f"Saved {self._record_description(*values[:3])}"
+        if platform == "android":
+            has_position = all(value is not None for value in gnss_values[:2])
+            message += "; GNSS saved" if has_position else "; GNSS blank"
+        self._set_status(message)
         self._success_feedback()
         self._focus_first_measurement_field()
         return True
@@ -1817,6 +2008,9 @@ class MangoRecorder(BoxLayout):
         self._request_audio_permission()
 
     def _request_audio_permission(self):
+        if getattr(self, "_location_permission_pending", False):
+            self._set_status("Finish location permission, then tap START VOICE")
+            return
         from android.permissions import (
             Permission,
             check_permission,
@@ -2269,6 +2463,9 @@ class MangoRecorder(BoxLayout):
                 "SamplingRole",
                 "Comment",
                 "Timestamp",
+                "Longitude",
+                "Latitude",
+                "GNSS quality",
             ]
         )
 
@@ -2278,7 +2475,7 @@ class MangoRecorder(BoxLayout):
                     """
                     SELECT block, tree_id, panicle_id, cultivar, l, w, t,
                            weight, predicted_weight, brix, sampling_role,
-                           comment, recorded_at
+                           comment, recorded_at, longitude, latitude, gnss_quality
                     FROM measurements
                     WHERE worksheet_id = ?
                     ORDER BY id
@@ -2388,6 +2585,8 @@ class MangoLWTApp(App):
         return MangoRecorder()
 
     def on_pause(self):
+        if self.root is not None:
+            self.root.pause_gnss()
         if (
             self.root is not None
             and not self.root._voice_permission_pending
@@ -2395,8 +2594,16 @@ class MangoLWTApp(App):
             self.root.stop_voice_control()
         return True
 
+    def on_resume(self):
+        if self.root is not None:
+            self.root.resume_gnss()
+
     def on_stop(self):
         if self.root is not None:
+            self.root.pause_gnss()
+            self.root._gnss_refresh_event.cancel()
+            if self.root._gnss_permission_retry_event is not None:
+                self.root._gnss_permission_retry_event.cancel()
             self.root.stop_voice_control(destroy=True)
 
 

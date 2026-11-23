@@ -20,6 +20,10 @@ The on-screen fields are:
 - SamplingRole (`Core`, `Reserve`, `Destructive`, `Observation`, `Drop`, or
   `Replaced`; optional)
 - Comment (optional)
+- Longitude (automatic, decimal degrees)
+- Latitude (automatic, decimal degrees)
+- GNSS quality (automatic receiver fix-quality code)
+- GNSS status
 
 Four collection modes are available:
 
@@ -60,8 +64,36 @@ record.
 Exported CSV columns:
 
 ```text
-Block,TreeID,PanicleID,Cultivar,L,W,T,Weight,Predicted_Weight,Brix,SamplingRole,Comment,Timestamp
+Block,TreeID,PanicleID,Cultivar,L,W,T,Weight,Predicted_Weight,Brix,SamplingRole,Comment,Timestamp,Longitude,Latitude,GNSS quality
 ```
+
+On Android, saving a record captures the phone's latest fresh GNSS position along
+with the save timestamp. Grant **precise location** permission and enable device
+location services. The form displays the current automatic values and GNSS
+status; no extra typing is required. Position updates run while the app is in the
+foreground and stop when it is paused or closed.
+
+If the coordinate fields stay blank, check **GNSS status** and tap **RETRY GNSS**.
+It checks location permission again and restarts the receiver. Microphone and
+location permission dialogs are requested separately to avoid a canceled request
+leaving GNSS stuck. Saving on Android reports **GNSS saved** when the record
+contains coordinates, or **GNSS blank** when no fresh position was available.
+This does not change or backfill previously saved records.
+
+**GNSS components missing; reinstall rebuilt APK** means the installed package
+does not contain the location Java files. Copy the complete source and perform
+the clean build below. **Waiting for GNSS fix** means location updates have been
+requested but a fresh satellite position has not arrived yet. **Allow precise
+location...** means precise location permission is still required.
+
+`GNSS quality` is the receiver's NMEA GGA fix-quality code, not an accuracy in
+metres. Common codes are `1` (GNSS fix), `2` (differential fix), `4` (RTK fixed),
+and `5` (RTK float). Quality is saved only when the receiver reports a matching
+GGA fix. A phone that does not expose GGA can still save longitude and latitude
+with blank quality. Fixes older than 10 seconds are discarded. Missing location
+permission, an unavailable/stale fix, or a device without GNSS leaves the
+unavailable values blank and does not prevent measurement collection. Desktop
+and iOS currently leave these automatic GNSS fields blank.
 
 Data is saved immediately to a local SQLite database. Only populated numeric
 fields are validated. In a manual worksheet, Block and TreeID remain unchanged
@@ -80,8 +112,9 @@ Tap **IMPORT CSV** to create a worksheet from a CSV template. A valid template
 must have `Block`, `TreeID`, and `PanicleID` columns, and every nonblank row must
 contain values for those three fields. The remaining supported columns are
 optional: `Cultivar`, `L`, `W`, `T`, `Weight`, `Brix`, `SamplingRole`, and
-`Comment`. A `Timestamp` column is allowed but is ignored because the app records
-the actual save time.
+`Comment`. `Timestamp`, `Longitude`, `Latitude`, and `GNSS quality` columns are
+allowed but ignored: the app captures the save time and current phone GNSS data
+when each measurement is saved.
 
 Template rows are not counted as collected measurements. The app displays and
 prefills the next unfinished template row; **SAVE & NEXT** records it and advances
@@ -132,20 +165,64 @@ buildozer android debug
 ```
 
 ```bash
-mkdir mango_lwt_recorder
-cd mango_lwt_recorder
-cp /mnt/c/Users/Folder_To_Downloads/mango_lwt_recorder/main.py ~/mango_lwt_recorder/main.py
-cp /mnt/c/Users/Folder_To_Downloads/mango_lwt_recorder/buildozer.spec ~/mango_lwt_recorder/buildozer.spec
+mkdir -p ~/mango_lwt_recorder
+cd ~/mango_lwt_recorder
+APP_SOURCE=/mnt/c/Users/Patrick/Documents/GitHub/mango_lwt_recorder
+cp "$APP_SOURCE"/{main.py,gnss.py,template_csv.py,validate_android_source.py,repair_android_pip.py,buildozer.spec,FruitSizingTemp.csv} .
+cp -R "$APP_SOURCE/src" .
 sudo apt update && sudo apt install python3.12-venv # only use for the first time user
 python3 -m venv .venv # only use for the first time user
 source .venv/bin/activate
 pip install buildozer # only use for the first time user
+python3 validate_android_source.py
+buildozer android clean
 buildozer android debug
 ```
 
-
+Adjust `APP_SOURCE` if the Windows checkout is in a different directory. Always
+copy all listed files and the complete `src` directory to a separate WSL build
+directory. Copying only `main.py` and `buildozer.spec` omits the GNSS Python module
+and Java classes. The source validation command checks for these files and both
+location permissions; fix any reported errors before building. A clean build is
+required after Java or permission changes so they are included in the new APK.
 
 The APK will appear in the `bin/` directory. For release distribution, configure signing and build an AAB.
+
+If a dependency download fails with `curl 92 HTTP/2`, `early EOF`, or
+`fetch-pack: invalid index-pack output`, resume from the activated WSL project
+directory using HTTP/1.1 for that build's Git subprocesses:
+
+```bash
+env GIT_CONFIG_COUNT=1 \
+    GIT_CONFIG_KEY_0=http.version \
+    GIT_CONFIG_VALUE_0=HTTP/1.1 \
+    buildozer android debug
+```
+
+This keeps the existing build cache and applies the HTTP setting only to this
+command. A continued `Connection reset by peer` indicates the transfer is still
+being interrupted. The available HTTP versions and command-scoped environment
+configuration are described in the [Git configuration documentation](https://git-scm.com/docs/git-config).
+
+If a Python 3.14 build fails with `cannot import name 'capture_logging'`, the
+temporary build environment may contain mixed pip versions. The current p4a
+bootstrap can overlay its bundled pip when recreating an existing environment.
+After the failed build has exited, run:
+
+```bash
+python3 repair_android_pip.py
+buildozer android debug
+```
+
+The helper backs up only the temporary build `venv`, recreates it with the
+compiled host Python, and constrains its pip to that host's bundled version.
+Native Android libraries and the project's `.venv` are retained. It also fixes
+the known target-wheel install command to use the same Android platform tags as
+dependency resolution, preventing Android wheels from being checked against the
+Linux host platform. The original toolchain file and environment are preserved
+under `.buildozer/pip-recovery-backups`. The helper refuses to run alongside an
+active build or against an unrecognized install-command layout. A full clean
+removes the temporary pip configuration; rerun the helper if the issue returns.
 
 ## iOS build
 
@@ -195,8 +272,8 @@ On iPhone and desktop, the Voice control text box remains available as a fallbac
 type a command, or use the iPhone keyboard microphone and then press Return.
 
 The Android speech result listener includes a small Java-to-Python string bridge.
-After pulling voice-control changes, use a clean build so the Java source is added
-to the APK:
+After pulling voice-control or GNSS changes, use a clean build so the Java source
+and location permissions are added to the APK:
 
 ```bash
 buildozer android clean
